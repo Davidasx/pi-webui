@@ -1,0 +1,77 @@
+{
+	"name": "pi-webui",
+	"version": "1.0.0",
+	"description": "Browser companion for the current Pi terminal session, shared through a fixed-port hub service.",
+	"type": "module",
+	"license": "MIT",
+	"private": true,
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"pi",
+		"web",
+		"chat",
+		"browser",
+		"hub"
+	],
+	"files": [
+		"src",
+		"bin",
+		"README.md",
+		"LICENSE"
+	],
+	"bin": {
+		"pi-webui-hub": "./bin/pi-webui-hub.mjs"
+	},
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"scripts": {
+		"build:web": "node scripts/build-web.mjs",
+		"check": "biome check --vcs-use-ignore-file=false src test scripts bin package.json tsconfig.json vitest.config.ts",
+		"check:web": "node scripts/build-web.mjs --check",
+		"format": "biome check --write --vcs-use-ignore-file=false src test scripts bin package.json tsconfig.json vitest.config.ts && npm run build:web",
+		"hub": "node ./bin/pi-webui-hub.mjs",
+		"test": "vitest run",
+		"typecheck": "npm run check:web && tsc --noEmit",
+		"verify": "npm run check && npm run typecheck && npm test"
+	},
+	"dependencies": {
+		"@narumitw/pi-tui-kit": "^0.65.5",
+		"@radix-ui/colors": "^3.0.0",
+		"@radix-ui/react-icons": "^1.3.2",
+		"@radix-ui/themes": "^3.3.0",
+		"bmp-js": "^0.1.0",
+		"heic-decode": "^2.1.0",
+		"proper-lockfile": "^4.1.2",
+		"radix-ui": "1.6.7",
+		"react": "^19.2.8",
+		"react-dom": "^19.2.8",
+		"sharp": "^0.35.3"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.15",
+		"@earendil-works/pi-ai": "1.1.0",
+		"@earendil-works/pi-coding-agent": "1.1.0",
+		"@earendil-works/pi-tui": "1.1.0",
+		"@types/node": "^26.6.4",
+		"@types/proper-lockfile": "^4.1.4",
+		"esbuild": "^0.28.2",
+		"typescript": "^7.0.2",
+		"vitest": "^5.0.3"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Davidasx/pi-webui.git"
+	},
+	"homepage": "https://github.com/Davidasx/pi-webui",
+	"bugs": {
+		"url": "https://github.com/Davidasx/pi-webui/issues"
+	}
+}

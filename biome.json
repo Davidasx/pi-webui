@@ -1,0 +1,35 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
+	"vcs": {
+		"enabled": true,
+		"clientKind": "git",
+		"useIgnoreFile": true
+	},
+	"files": {
+		"includes": ["**", "!node_modules", "!package-lock.json", "!src/web/app.js", "!src/web/app.css"]
+	},
+	"formatter": {
+		"enabled": false
+	},
+	"linter": {
+		"rules": {
+			"preset": "recommended",
+			"complexity": {
+				"noUselessTypeConstraint": "error"
+			},
+			"performance": {
+				"noReExportAll": "error"
+			},
+			"style": {
+				"useAsConstAssertion": "error",
+				"useConsistentArrayType": "error",
+				"useConst": "error",
+				"useShorthandFunctionType": "error",
+				"useSingleVarDeclarator": "error"
+			},
+			"suspicious": {
+				"noExtraNonNullAssertion": "error"
+			}
+		}
+	}
+}
