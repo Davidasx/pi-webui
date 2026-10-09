@@ -1,5 +1,9 @@
 # pi-webui — browser companion for the current Pi session, over a fixed-port hub
 
+**English** | [中文](README.zh-CN.md)
+
+> **Promotion statement**: this project is fully open source (MIT) and is promoted on public boards under the [LINUX DO](https://linux.do) community open-source promotion rules. Thanks to the community for the feedback behind it.
+
 A private browser view of the Pi session that is running in your terminal, shared through one
 fixed port across all of your Pi sessions.
 
