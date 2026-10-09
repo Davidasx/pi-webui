@@ -28,7 +28,7 @@ pi-webui 从结构上避开了这一整类问题：
 ## 环境要求
 
 - **Node.js ≥ 22.18**（Hub 用 `bin/pi-webui-hub.mjs` 通过 Node 内置的类型擦除直接加载 TypeScript 源码，所以没有构建步骤）。实际测试环境是 Node 24/26。
-- Pi Coding Agent 1.x；如果你要用图片流水线里的可选格式（PNG/JPEG/WebP/GIF/BMP/TIFF/HEIF/AVIF 由 sharp 处理），运行扩展的会话里需要有 `git`。
+- Pi Coding Agent；如果你要用图片流水线里的可选格式（PNG/JPEG/WebP/GIF/BMP/TIFF/HEIF/AVIF 由 sharp 处理），运行扩展的会话里需要有 `git`。
 
 ## 安装
 

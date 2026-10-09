@@ -46,7 +46,7 @@ or task board, and the page lives only as long as that Pi session.
 
 - **Node.js ≥ 22.18** for the hub (`bin/pi-webui-hub.mjs` loads the TypeScript source through
   Node's built-in type stripping, so there is no build step). Node 24/26 are what this was tested on.
-- Pi Coding Agent 1.x, and the extension installed in a session that has `git` available if you use
+- Pi Coding Agent, and the extension installed in a session that has `git` available if you use
   the image pipeline's optional formats (sharp handles PNG/JPEG/WebP/GIF/BMP/TIFF/HEIF/AVIF).
 
 ## Install
