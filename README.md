@@ -53,20 +53,16 @@ or task board, and the page lives only as long as that Pi session.
 
 ### 1. The extension
 
-Add the checkout to Pi's package list (the same way other local extensions are installed):
+Install it from GitHub:
 
-```jsonc
-// ~/.pi/agent/settings.json
-{
-  "packages": ["/path/to/pi-webui"]
-}
+```bash
+pi install git:github.com/Davidasx/pi-webui
 ```
 
-Or install it ad hoc for one run:
+Or load a local checkout for one run, without installing anything:
 
 ```bash
 pi -e /path/to/pi-webui
-pi install /path/to/pi-webui      # permanent, package form
 ```
 
 ### 2. The hub (systemd user service)

@@ -34,20 +34,16 @@ pi-webui 从结构上避开了这一整类问题：
 
 ### 1. 扩展
 
-把本仓库加入 Pi 的包列表（和其他本地扩展的装法一致）：
+从 GitHub 安装：
 
-```jsonc
-// ~/.pi/agent/settings.json
-{
-  "packages": ["/path/to/pi-webui"]
-}
+```bash
+pi install git:github.com/Davidasx/pi-webui
 ```
 
-或者只临时跑一次：
+或者临时加载本地目录跑一次，不写入任何安装记录：
 
 ```bash
 pi -e /path/to/pi-webui
-pi install /path/to/pi-webui      # 以包的形式永久安装
 ```
 
 ### 2. Hub（systemd 用户服务）
