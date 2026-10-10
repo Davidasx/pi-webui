@@ -1,9 +1,6 @@
-import { createHash, randomBytes } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createHash, } from "node:crypto";
+import { createServer, type Server } from "node:http";
 import type { Socket } from "node:net";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import {
 	AttachmentError,
 	type AttachmentLimits,
@@ -13,6 +10,7 @@ import {
 } from "./attachments.js";
 import type { ConversationEvent, ConversationProjection } from "./conversation.js";
 import { DraftError, DraftStore, type PublicDraftState } from "./drafts.js";
+import { HUB_NAME } from "./hub-protocol.js";
 import { type ImageLimits, imageLimits, PROVIDER_IMAGE_LIMITS } from "./image-limits.js";
 import type { BrowserImageInput } from "./images.js";
 import { SentImageError, type SentImageSettings, SentImageStore } from "./sent-images.js";
@@ -24,14 +22,53 @@ const MAX_REQUESTS = 128;
 const DEFAULT_MAX_DRAFT_TEXT_BYTES = 1024 * 1024;
 const DEFAULT_SSE_KEEP_ALIVE_MS = 15_000;
 const SSE_FLUSH_TIMEOUT_MS = 250;
-const CSP_NONCE_PLACEHOLDER = "__PI_CSP_NONCE__";
-const BASE_HREF_PLACEHOLDER = "__PI_BASE_HREF__";
-/** Base path the hub proxies this session under, e.g. `/s/<sessionId>/`. */
-const BASE_PATH_PATTERN = /^\/s\/[A-Za-z0-9_-]{1,80}\/$/;
+/** Set by the hub on every tunneled request, after it validated Host and Origin itself. */
+const HUB_VIA_HEADER = "x-pi-webui-via";
+const HUB_ORIGIN_HEADER = "x-pi-webui-origin";
 
-function basePathOf(value: unknown): string {
-	if (typeof value !== "string" || !BASE_PATH_PATTERN.test(value)) return "/";
-	return value;
+function isHubRequest(request: WebServerRequest): boolean {
+	return request.headers[HUB_VIA_HEADER] === HUB_NAME;
+}
+
+/**
+ * What the session's web API needs from a request, whichever transport delivers it: Node's HTTP
+ * server (tests and the optional local listener) or the hub channel's frames.
+ */
+export interface WebServerRequest {
+	method?: string;
+	url?: string;
+	headers: Record<string, string | string[] | undefined>;
+	socket?: { destroySoon?: () => void };
+	once(event: string, listener: () => void): unknown;
+	off(event: string, listener: () => void): unknown;
+	[Symbol.asyncIterator](): AsyncIterator<Uint8Array>;
+}
+
+/** The matching response surface. */
+export interface WebServerResponse {
+	readonly headersSent: boolean;
+	readonly destroyed: boolean;
+	readonly writableEnded: boolean;
+	readonly writableFinished: boolean;
+	setHeader(name: string, value: string | string[] | number): void;
+	getHeader?(name: string): string | number | string[] | undefined;
+	writeHead(status: number, headers?: Record<string, string | string[] | number>): unknown;
+	write(chunk: string | Uint8Array): boolean;
+	end(chunk?: string | Uint8Array | (() => void), callback?: () => void): void;
+	flushHeaders(): void;
+	once(event: string, listener: () => void): unknown;
+	off(event: string, listener: () => void): unknown;
+	destroy?(): void;
+}
+
+/** Everything the service needs to know about where the browser sees it. */
+export interface WebUIIdentity {
+	/** Browser-visible origin, used to validate `Origin` on mutations. */
+	origin: string;
+	/** Loopback port for the optional local listener; 0 when only the hub serves this session. */
+	port?: number;
+	/** Local HTTP server backing `port`; only the optional listener passes one. */
+	server?: Server;
 }
 
 export interface WebSendRequest {
@@ -52,12 +89,22 @@ interface ParsedSendRequest {
 }
 
 export interface WebSendResult {
-	delivery: "immediate" | "followUp" | "steer";
+	delivery: "immediate" | "followUp" | "steer" | "command";
+}
+
+/** What the top bar needs from the session: Pi's own controls, not the web layer's. */
+export interface WebUISessionControls {
+	/** Models this session can switch to. */
+	models(): Promise<Array<{ provider: string; id: string; name?: string }>>;
+	setModel(provider: string, id: string): Promise<void>;
+	setThinkingLevel(level: string): Promise<void>;
+	compact(): Promise<void>;
 }
 
 export interface WebUIServerOptions {
 	conversation: ConversationProjection;
 	send: (request: WebSendRequest) => Promise<WebSendResult>;
+	controls?: WebUISessionControls;
 	processAttachment?: (source: Uint8Array, signal?: AbortSignal) => Promise<PreparedAttachment>;
 	attachmentLimits?: AttachmentLimits;
 	imageLimits?: Readonly<ImageLimits>;
@@ -69,7 +116,7 @@ export interface WebUIServerOptions {
 }
 
 interface SseClient {
-	response: ServerResponse;
+	response: WebServerResponse;
 }
 
 interface RequestRecord {
@@ -89,9 +136,12 @@ class HttpError extends Error {
 }
 
 export class WebUIServer {
+	/** Browser-visible origin: the hub's origin in production, this listener's own in tests. */
 	readonly origin: string;
+	/** Loopback port of the optional local listener; 0 when only the hub serves this session. */
 	readonly port: number;
-	private readonly cspNonce = token();
+	private readonly browserOrigin: string;
+	private readonly server?: Server;
 	private readonly sockets = new Set<Socket>();
 	private readonly sseClients = new Set<SseClient>();
 	private readonly requests = new Map<string, RequestRecord>();
@@ -110,12 +160,13 @@ export class WebUIServer {
 	private readonly unsubscribe: () => void;
 
 	private constructor(
-		private readonly server: Server,
 		private readonly options: WebUIServerOptions,
-		port: number,
+		identity: WebUIIdentity,
 	) {
-		this.origin = `http://127.0.0.1:${port}`;
-		this.port = port;
+		this.origin = identity.origin;
+		this.browserOrigin = identity.origin;
+		this.port = identity.port ?? 0;
+		this.server = identity.server;
 		this.imageLimits = options.imageLimits
 			? imageLimits(options.imageLimits)
 			: imageLimits({
@@ -159,11 +210,12 @@ export class WebUIServer {
 				this.broadcastControl("attachments", state);
 			},
 		});
-		server.on("connection", (socket) => {
+		// Only the optional local listener owns sockets; over the channel there is nothing to track.
+		this.server?.on("connection", (socket) => {
 			this.sockets.add(socket);
 			socket.once("close", () => this.sockets.delete(socket));
 		});
-		server.unref();
+		this.server?.unref();
 		this.unsubscribe = options.conversation.subscribe((event) => this.broadcastEvent(event));
 	}
 
@@ -174,7 +226,7 @@ export class WebUIServer {
 				response.writeHead(503).end();
 				return;
 			}
-			void instance.handle(request, response);
+			void instance.serve(request, response);
 		});
 		await new Promise<void>((resolve, reject) => {
 			server.once("error", reject);
@@ -188,14 +240,21 @@ export class WebUIServer {
 			server.close();
 			throw new Error("Pi WebUI server did not receive a TCP port");
 		}
-		instance = new WebUIServer(server, options, address.port);
+		instance = new WebUIServer(options, {
+			origin: `http://127.0.0.1:${address.port}`,
+			port: address.port,
+			server,
+		});
 		return instance;
 	}
 
-	/** Direct loopback URL for this session, used when no hub is reachable. */
-	directUrl(): string {
-		if (this.closed) throw new Error("Pi WebUI server is closed");
-		return `${this.origin}/`;
+	/**
+	 * Build the service without a listener: the hub drives it over the channel, so a session owns
+	 * no port. `origin` is the browser-visible origin (the hub's), which mutations are checked
+	 * against.
+	 */
+	static create(options: WebUIServerOptions, origin: string): WebUIServer {
+		return new WebUIServer(options, { origin });
 	}
 
 	close(): Promise<void> {
@@ -220,31 +279,25 @@ export class WebUIServer {
 		this.broadcastControl("session-ended", { message: "Pi session ended" });
 		await Promise.all(responses.map((response) => finishResponse(response)));
 		this.sseClients.clear();
-		this.server.closeAllConnections?.();
+		this.server?.closeAllConnections?.();
 		for (const socket of this.sockets) socket.destroy();
-		await new Promise<void>((resolve) => this.server.close(() => resolve()));
+		if (this.server) await new Promise<void>((resolve) => this.server?.close(() => resolve()));
 	}
 
-	private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+	/**
+	 * Serve one browser request, whichever transport delivered it: Node's HTTP server (tests and the
+	 * optional local listener) or the hub channel's frames.
+	 */
+	async serve(request: WebServerRequest, response: WebServerResponse): Promise<void> {
 		this.secureHeaders(response);
 		try {
 			if (this.closed) throw new HttpError(410, "Pi session ended");
-			if (request.headers.host !== new URL(this.origin).host) {
+			// The hub validates Host and Origin itself before it tunnels a request here, and says so;
+			// a direct caller (the optional local listener) still has to match this browser origin.
+			if (!isHubRequest(request) && request.headers.host !== new URL(this.browserOrigin).host) {
 				throw new HttpError(421, "Unexpected Host header");
 			}
-			const url = new URL(request.url ?? "/", this.origin);
-			if (request.method === "GET" && url.pathname === "/") {
-				await this.asset(request, response, "index.html", "text/html; charset=utf-8");
-				return;
-			}
-			if (request.method === "GET" && url.pathname === "/app.js") {
-				await this.asset(request, response, "app.js", "text/javascript; charset=utf-8");
-				return;
-			}
-			if (request.method === "GET" && url.pathname === "/app.css") {
-				await this.asset(request, response, "app.css", "text/css; charset=utf-8");
-				return;
-			}
+			const url = new URL(request.url ?? "/", this.browserOrigin);
 			if (request.method === "GET" && url.pathname === "/api/state") {
 				this.json(response, 200, {
 					...this.options.conversation.snapshot(),
@@ -280,6 +333,10 @@ export class WebUIServer {
 				this.events(url, request, response);
 				return;
 			}
+			if (request.method === "GET" && url.pathname === "/api/controls/models") {
+				this.json(response, 200, { models: (await this.options.controls?.models()) ?? [] });
+				return;
+			}
 			this.assertMutation(request);
 			if (request.method === "POST" && url.pathname === "/api/lease") {
 				const body = await readJson(request, 8 * 1024);
@@ -304,6 +361,31 @@ export class WebUIServer {
 				return;
 			}
 			const lease = this.assertActiveClient(request);
+			if (request.method === "POST" && url.pathname === "/api/controls/model") {
+				this.assertLease(lease);
+				const body = await readJson(request, 8 * 1024);
+				if (!isRecord(body)) throw new HttpError(400, "Invalid model request");
+				const controls = this.requireControls();
+				await controls.setModel(stringField(body, "provider"), stringField(body, "id"));
+				this.json(response, 200, { ok: true });
+				return;
+			}
+			if (request.method === "POST" && url.pathname === "/api/controls/thinking") {
+				this.assertLease(lease);
+				const body = await readJson(request, 8 * 1024);
+				if (!isRecord(body)) throw new HttpError(400, "Invalid thinking request");
+				const controls = this.requireControls();
+				await controls.setThinkingLevel(stringField(body, "level"));
+				this.json(response, 200, { ok: true });
+				return;
+			}
+			if (request.method === "POST" && url.pathname === "/api/controls/compact") {
+				this.assertLease(lease);
+				const controls = this.requireControls();
+				await controls.compact();
+				this.json(response, 200, { ok: true });
+				return;
+			}
 			if (request.method === "POST" && url.pathname === "/api/draft") {
 				const body = requireRecord(
 					await readJson(
@@ -468,11 +550,21 @@ export class WebUIServer {
 	}
 
 
-	private assertMutation(request: IncomingMessage): void {
-		if (request.headers.origin !== this.origin) throw new HttpError(403, "Unexpected Origin");
+	private requireControls(): WebUISessionControls {
+		const controls = this.options.controls;
+		if (!controls) throw new HttpError(503, "This session does not expose its controls");
+		return controls;
 	}
 
-	private assertActiveClient(request: IncomingMessage): { clientId: string; generation: number } {
+	private assertMutation(request: WebServerRequest): void {
+		// Behind the hub, the browser's origin is whatever host the operator uses (a tunnel hostname),
+		// so accept the origin the hub already checked against its own Host header.
+		const viaHub = isHubRequest(request) ? request.headers[HUB_ORIGIN_HEADER] : undefined;
+		const expected = typeof viaHub === "string" ? viaHub : this.browserOrigin;
+		if (request.headers.origin !== expected) throw new HttpError(403, "Unexpected Origin");
+	}
+
+	private assertActiveClient(request: WebServerRequest): { clientId: string; generation: number } {
 		const clientId = request.headers["x-pi-web-client"];
 		if (typeof clientId !== "string" || clientId !== this.activeClientId) {
 			throw new HttpError(409, "This browser tab is stale");
@@ -487,8 +579,8 @@ export class WebUIServer {
 	}
 
 	private async runAttachmentOperation(
-		request: IncomingMessage,
-		response: ServerResponse,
+		request: WebServerRequest,
+		response: WebServerResponse,
 		operation: (signal: AbortSignal) => PublicAttachmentState | Promise<PublicAttachmentState>,
 	): Promise<PublicAttachmentState> {
 		const controller = new AbortController();
@@ -507,8 +599,8 @@ export class WebUIServer {
 
 	private async sendDeduplicated(
 		message: ParsedSendRequest,
-		request: IncomingMessage,
-		response: ServerResponse,
+		request: WebServerRequest,
+		response: WebServerResponse,
 	): Promise<WebSendResult> {
 		const hash = messageDigest(message);
 		const current = this.requests.get(message.requestId);
@@ -630,7 +722,7 @@ export class WebUIServer {
 		}
 	}
 
-	private events(url: URL, request: IncomingMessage, response: ServerResponse): void {
+	private events(url: URL, request: WebServerRequest, response: WebServerResponse): void {
 		const sinceText = url.searchParams.get("since") ?? "0";
 		if (!/^\d+$/.test(sinceText)) throw new HttpError(400, "Invalid event cursor");
 		const since = Number(sinceText);
@@ -735,31 +827,14 @@ export class WebUIServer {
 		}
 	}
 
-	private async asset(
-		request: IncomingMessage,
-		response: ServerResponse,
-		name: string,
-		contentType: string,
-	): Promise<void> {
-		const asset = await readAsset(name);
-		const content =
-			name === "index.html"
-				? Buffer.from(
-						asset
-							.toString("utf8")
-							.replaceAll(CSP_NONCE_PLACEHOLDER, this.cspNonce)
-							.replaceAll(BASE_HREF_PLACEHOLDER, basePathOf(request.headers["x-pi-webui-base"])),
-					)
-				: asset;
-		response.writeHead(200, { "Content-Type": contentType, "Content-Length": content.byteLength });
-		response.end(content);
-	}
-
-	private secureHeaders(response: ServerResponse): void {
+	/**
+	 * The page shell is served by the hub, so a session response is data only and carries no nonce.
+	 */
+	private secureHeaders(response: WebServerResponse): void {
 		response.setHeader("Cache-Control", "no-store");
 		response.setHeader(
 			"Content-Security-Policy",
-			`default-src 'self'; script-src 'self'; style-src 'self' 'nonce-${this.cspNonce}'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'`,
+			"default-src 'none'; connect-src 'self'; img-src 'self' data: blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
 		);
 		response.setHeader("Referrer-Policy", "no-referrer");
 		response.setHeader("X-Content-Type-Options", "nosniff");
@@ -767,7 +842,7 @@ export class WebUIServer {
 		response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
 	}
 
-	private json(response: ServerResponse, status: number, value: unknown): void {
+	private json(response: WebServerResponse, status: number, value: unknown): void {
 		if (response.headersSent || response.writableEnded) return;
 		const body = JSON.stringify(value);
 		response.writeHead(status, {
@@ -778,7 +853,7 @@ export class WebUIServer {
 	}
 }
 
-function finishResponse(response: ServerResponse): Promise<void> {
+function finishResponse(response: WebServerResponse): Promise<void> {
 	if (response.destroyed || response.writableFinished) return Promise.resolve();
 	return new Promise((resolve) => {
 		let settled = false;
@@ -796,16 +871,6 @@ function finishResponse(response: ServerResponse): Promise<void> {
 			response.end(done);
 		}
 	});
-}
-
-async function readAsset(name: string): Promise<Buffer> {
-	const runtimePath = join(fileURLToPath(new URL(".", import.meta.url)), "web", name);
-	try {
-		return await readFile(runtimePath);
-	} catch (error) {
-		if (!isNodeError(error) || error.code !== "ENOENT") throw error;
-		return readFile(join(process.cwd(), "src", "web", name));
-	}
 }
 
 function messageDigest(message: ParsedSendRequest): string {
@@ -830,7 +895,7 @@ function parseSendRequest(value: unknown): ParsedSendRequest {
 	return { requestId, draftRevision, delivery };
 }
 
-async function readBytes(request: IncomingMessage, limit: number): Promise<Buffer> {
+async function readBytes(request: WebServerRequest, limit: number): Promise<Buffer> {
 	const length = Number(request.headers["content-length"] ?? "0");
 	if (Number.isFinite(length) && length > limit) {
 		throw new HttpError(413, "Request body is too large", true);
@@ -846,7 +911,7 @@ async function readBytes(request: IncomingMessage, limit: number): Promise<Buffe
 	return Buffer.concat(chunks);
 }
 
-async function readJson(request: IncomingMessage, limit: number): Promise<unknown> {
+async function readJson(request: WebServerRequest, limit: number): Promise<unknown> {
 	const chunks: Buffer[] = [];
 	let total = 0;
 	for await (const chunk of request) {
@@ -950,16 +1015,11 @@ function sameIds(left: readonly string[], right: readonly string[]): boolean {
 	return left.length === right.length && left.every((id, index) => id === right[index]);
 }
 
-function token(): string {
-	return randomBytes(32).toString("base64url");
-}
-
-
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+function _isNodeError(error: unknown): error is NodeJS.ErrnoException {
 	return error instanceof Error && "code" in error;
 }
 

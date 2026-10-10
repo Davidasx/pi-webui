@@ -2,19 +2,28 @@ import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type {
+	ContextUsage,
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 import type { PreparedAttachment } from "./attachments.js";
-import { ConversationProjection, projectBranchMessages } from "./conversation.js";
-import { HubClient, type HubClientOptions, type HubClientStatus } from "./hub-client.js";
+import {
+	ConversationProjection,
+	type PublicCommand,
+	projectBranchMessages,
+	type SessionControls,
+} from "./conversation.js";
+import { HubChannel, type HubChannelOptions } from "./hub-channel.js";
 import { HUB_UNIT_NAME, hubInstallSteps, packageVersion, renderHubUnit } from "./hub-install.js";
 import {
+	type ChannelStatus,
 	CONFIG_FILE_NAME,
+	channelUrl,
+	HUB_PROTOCOL,
 	type HubConfigRead,
-	type HubRegistration,
+	type HubSessionInfo,
 	hubBaseUrl,
 	readHubConfig,
 } from "./hub-protocol.js";
@@ -50,6 +59,44 @@ const EXPERIMENTAL_WARNING =
 	"pi-webui is experimental; its browser workflow and package API may change.";
 const INPUT_HEADER = /^<pi-webui-input nonce="([0-9a-f-]+)">\n/;
 const INPUT_FOOTER = "\n</pi-webui-input>";
+const CHANNEL_CONNECT_WAIT_MS = 1_500;
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+/**
+ * Pi's built-in slash commands belong to the terminal UI, not to the prompt path. The browser
+ * implements the ones it can and names the others, so typing `/tree` here never silently reaches
+ * the model as prose.
+ */
+const BUILTIN_COMMANDS: ReadonlyArray<{
+	name: string;
+	description: string;
+	support: "compact" | "name" | "thinking" | "models" | "terminal";
+}> = [
+	{ name: "compact", description: "Compact the session context", support: "compact" },
+	{ name: "name", description: "Set the session name", support: "name" },
+	{ name: "thinking", description: "Set the thinking level", support: "thinking" },
+	{ name: "model", description: "Switch models from the top bar", support: "models" },
+	{ name: "settings", description: "Pi settings live in the terminal", support: "terminal" },
+	{ name: "tree", description: "Branch navigation needs the terminal", support: "terminal" },
+	{ name: "fork", description: "Forking needs the terminal", support: "terminal" },
+	{ name: "clone", description: "Cloning needs the terminal", support: "terminal" },
+	{ name: "new", description: "New sessions start in the terminal", support: "terminal" },
+	{ name: "resume", description: "Switching sessions needs the terminal", support: "terminal" },
+	{ name: "export", description: "Export runs in the terminal", support: "terminal" },
+	{ name: "share", description: "Sharing runs in the terminal", support: "terminal" },
+	{ name: "login", description: "Provider login runs in the terminal", support: "terminal" },
+	{ name: "logout", description: "Provider logout runs in the terminal", support: "terminal" },
+	{ name: "scoped-models", description: "Model scoping runs in the terminal", support: "terminal" },
+	{ name: "import", description: "Importing runs in the terminal", support: "terminal" },
+	{ name: "copy", description: "Copying the last reply runs in the terminal", support: "terminal" },
+	{ name: "session", description: "Session stats are in the top bar too", support: "terminal" },
+	{ name: "bug", description: "Bug reports run in the terminal", support: "terminal" },
+	{ name: "changelog", description: "The changelog shows in the terminal", support: "terminal" },
+	{ name: "hotkeys", description: "Keybindings belong to the terminal", support: "terminal" },
+	{ name: "trust", description: "Project trust is chosen in the terminal", support: "terminal" },
+	{ name: "reload", description: "Reloading runs in the terminal", support: "terminal" },
+	{ name: "quit", description: "Quitting belongs to the terminal", support: "terminal" },
+];
 const COMMAND_USAGE = "Usage: /webui [open|hub|settings|status|help|init]";
 const COMMAND_COMPLETIONS = [
 	{ value: "open", label: "open", description: "Open this session in the browser" },
@@ -60,7 +107,7 @@ const COMMAND_COMPLETIONS = [
 	{ value: "init", label: "init", description: "Create the default WebUI settings file" },
 ];
 
-type ServerControl = Pick<WebUIServer, "directUrl" | "close" | "port" | "origin">;
+type ServerControl = Pick<WebUIServer, "serve" | "close" | "origin">;
 type LatestEventHandler = (event: unknown, ctx: ExtensionContext) => void | Promise<void>;
 type LatestExtensionAPI = ExtensionAPI & {
 	on(event: "agent_settled", handler: LatestEventHandler): void;
@@ -82,7 +129,7 @@ export interface RuntimeDependencies {
 	loadSettings: typeof loadSettings;
 	saveSettings: typeof saveSettings;
 	initializeSettings: typeof initializeSettings;
-	startServer(options: WebUIServerOptions): Promise<ServerControl>;
+	createService(options: WebUIServerOptions, origin: string): ServerControl | Promise<ServerControl>;
 	readPiSettings(cwd: string, projectTrusted: boolean): Promise<EffectivePiImageSettings>;
 	processImages(
 		inputs: BrowserImageInput[],
@@ -92,18 +139,18 @@ export interface RuntimeDependencies {
 		source: Uint8Array,
 		options?: ProcessBrowserImageOptions,
 	): Promise<ProcessedBrowserImage>;
-	createHubClient(options: HubClientOptions): HubClient;
+	createChannel(options: HubChannelOptions): HubChannel;
 }
 
 const DEFAULT_DEPENDENCIES: RuntimeDependencies = {
 	loadSettings,
 	saveSettings,
 	initializeSettings,
-	startServer: (options) => WebUIServer.start(options),
+	createService: (options, origin) => WebUIServer.create(options, origin),
 	readPiSettings: readEffectivePiImageSettings,
 	processImages: processBrowserImages,
 	processAttachment: processStagedImage,
-	createHubClient: (options) => new HubClient(options),
+	createChannel: (options) => new HubChannel(options),
 };
 
 export class WebUIRuntime {
@@ -112,8 +159,8 @@ export class WebUIRuntime {
 	private conversation?: ConversationProjection;
 	private server?: ServerControl;
 	private serverStarting?: Promise<ServerControl>;
-	private hub?: HubClient;
-	private hubStatus: HubClientStatus = { state: "disabled", hubUrl: hubBaseUrl() };
+	private hub?: HubChannel;
+	private hubStatus: ChannelStatus = idleChannelStatus();
 	private sessionAbort = new AbortController();
 	private generation = 0;
 	private closed = true;
@@ -202,6 +249,20 @@ export class WebUIRuntime {
 		this.pi.on("session_info_changed", async (event, ctx) => {
 			this.captureContext(ctx);
 			this.conversation?.updateSession({ name: event.name });
+			this.publishSessionInfo();
+		});
+		this.pi.on("model_select", async (_event, ctx) => {
+			this.captureContext(ctx);
+			this.refreshControls(ctx);
+			this.publishSessionInfo();
+		});
+		this.pi.on("thinking_level_select", async (_event, ctx) => {
+			this.captureContext(ctx);
+			this.refreshControls(ctx);
+		});
+		this.pi.on("session_compact", async (_event, ctx) => {
+			this.captureContext(ctx);
+			this.refreshControls(ctx);
 		});
 		this.pi.on("input", (event) => {
 			if (event.source !== "extension") return;
@@ -229,6 +290,7 @@ export class WebUIRuntime {
 		});
 		this.pi.on("message_end", async (event, ctx) => {
 			this.captureContext(ctx);
+			this.refreshControls(ctx);
 			const sanitized = sanitizeBrowserMessageEvent(event, this.acceptedBrowserInputs, true);
 			this.recordMessage("end", sanitized);
 			// Pi applies this replacement before persistence and before the prompt reaches the model.
@@ -251,12 +313,15 @@ export class WebUIRuntime {
 		this.pi.on("agent_start", async (_event, ctx) => {
 			this.captureContext(ctx);
 			this.conversation?.setActivity("running");
+			this.publishSessionInfo();
 		});
 		(this.pi as LatestExtensionAPI).on("agent_settled", async (_event, ctx) => {
 			this.captureContext(ctx);
+			this.refreshControls(ctx);
 			if (ctx.isIdle() && !ctx.hasPendingMessages()) {
 				this.acceptedBrowserInputs.clear();
 				this.conversation?.setActivity("idle");
+				this.publishSessionInfo();
 			}
 		});
 	}
@@ -289,6 +354,8 @@ export class WebUIRuntime {
 					: {}),
 			},
 			projectBranchMessages(ctx.sessionManager.getBranch()),
+			undefined,
+			this.readControls(ctx),
 		);
 		this.closed = false;
 		this.lastSettingsWarning = "";
@@ -395,21 +462,33 @@ export class WebUIRuntime {
 	}
 
 	private async presentLink(ctx: ExtensionContext): Promise<void> {
-		const server = await this.ensureServer();
-		const hub = await this.ensureHub(server);
-		const status = await hub.refresh();
-		if (status.state === "registered" && status.sessionUrl) {
-			ctx.ui.setWidget(WIDGET_KEY, [`🌐 Pi WebUI: ${status.sessionUrl}`]);
-			ctx.ui.notify(`Pi WebUI: ${status.sessionUrl}`, "info");
+		const service = await this.ensureService();
+		const channel = this.ensureChannel(service);
+		const status = await this.waitForChannel();
+		if (status.state === "connected" && channel.sessionUrl()) {
+			const url = channel.sessionUrl() as string;
+			ctx.ui.setWidget(WIDGET_KEY, [`🌐 Pi WebUI: ${url}`]);
+			ctx.ui.notify(`Pi WebUI: ${url}`, "info");
 			return;
 		}
-		const direct = server.directUrl();
-		const reason = status.lastError ?? "not running";
-		ctx.ui.setWidget(WIDGET_KEY, [`🌐 Pi WebUI (hub offline): ${direct}`]);
+		const reason = status.error ?? "no answer";
+		ctx.ui.setWidget(WIDGET_KEY, [`🌐 Pi WebUI (waiting for the hub)`]);
 		ctx.ui.notify(
-			`Pi WebUI: the hub at ${status.hubUrl} is unavailable (${reason}).\nUsing a session-only link: ${direct}\nInstall the hub as a user service with /webui hub.`,
+			`Pi WebUI: the hub at ${status.hubUrl} did not answer (${reason}).\nThis session stays ready and connects as soon as the hub runs.\nInstall or restart it with /webui hub.`,
 			"warning",
 		);
+	}
+
+	/**
+	 * Give a fresh connection a moment to settle so `/webui open` reports what actually happened
+	 * instead of racing the handshake.
+	 */
+	private async waitForChannel(): Promise<ChannelStatus> {
+		const deadline = Date.now() + CHANNEL_CONNECT_WAIT_MS;
+		while (this.hubStatus.state !== "connected" && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+		return this.hubStatus;
 	}
 
 	private async openWebUI(ctx: ExtensionCommandContext): Promise<void> {
@@ -433,7 +512,7 @@ export class WebUIRuntime {
 			serverRunning: this.server !== undefined,
 			hubState: this.hubStatus.state,
 			hubUrl: this.hubStatus.hubUrl,
-			...(this.hubStatus.sessionUrl ? { sessionUrl: this.hubStatus.sessionUrl } : {}),
+			channelUrl: this.hubStatus.channelUrl,
 			startupAutomatic: this.settings.startOnSessionStart,
 			settingsSource:
 				this.settingsDocument === undefined
@@ -637,7 +716,8 @@ export class WebUIRuntime {
 			`Server: ${this.server ? `Running on ${this.server.origin}` : "Stopped"}`,
 			`Hub: ${hubStatusLine(this.hubStatus)}`,
 			`Hub settings: ${hubSettingsLine()}`,
-			...(this.hubStatus.sessionUrl ? [`Link: ${this.hubStatus.sessionUrl}`] : []),
+			...(this.hub?.sessionUrl() ? [`Link: ${this.hub.sessionUrl()}`] : []),
+			`Channel: ${safeTerminalText(this.hubStatus.channelUrl)}`,
 			`Startup: ${this.settings.startOnSessionStart ? "Every session" : "Manual"} (${source})`,
 			`Image limits (${source}): ${this.effectiveImageLimits.maxImages} images, ${formatMib(this.effectiveImageLimits.maxImageBytes)}/image, ${formatMib(this.effectiveImageLimits.maxBatchBytes)}/batch, ${this.effectiveImageLimits.maxImagePixels.toLocaleString("en-US")} pixels/image`,
 			`Settings: ${safeTerminalText(this.settingsPath)}`,
@@ -682,7 +762,7 @@ export class WebUIRuntime {
 	/** Print the systemd user unit and the install steps; the extension never spawns the hub. */
 	private async showHub(ctx: ExtensionCommandContext): Promise<void> {
 		if (!ctx.hasUI) return;
-		const status = this.hub ? await this.hub.refresh() : this.hubStatus;
+		const status = this.hubStatus;
 		const lines = [
 			"Pi WebUI hub",
 			`State: ${hubStatusLine(status)}`,
@@ -694,9 +774,9 @@ export class WebUIRuntime {
 			"Then run:",
 			...hubInstallSteps().map((step) => `  ${step}`),
 			"",
-			"The hub only routes requests to registered Pi sessions; it never reads or writes Pi session state.",
+			"The hub only routes requests to connected Pi sessions; it never reads or writes Pi session state.",
 		];
-		ctx.ui.notify(lines.join("\n"), status.state === "registered" ? "info" : "warning");
+		ctx.ui.notify(lines.join("\n"), status.state === "connected" ? "info" : "warning");
 	}
 
 	private async initializeSettings(ctx: ExtensionCommandContext): Promise<void> {
@@ -732,25 +812,40 @@ export class WebUIRuntime {
 		this.settingsSource = result.source;
 	}
 
-	private async ensureServer(): Promise<ServerControl> {
+	/**
+	 * Build this session's web service. It owns no listener: the hub drives it over the channel, so
+	 * the hub is the only port on the machine.
+	 */
+	private async ensureService(): Promise<ServerControl> {
 		if (this.closed || !this.conversation) throw new Error("the Pi session is not ready");
 		if (this.server) return this.server;
 		if (!this.serverStarting) {
 			const generation = this.generation;
 			const conversation = this.conversation;
-			const starting = this.dependencies.startServer({
-				conversation,
-				send: (request) => this.sendBrowserMessage(request, generation),
-				imageLimits: this.effectiveImageLimits,
-				sentImageSettings: {
-					enabled: this.settings.retainSentImages,
-					maxImages: this.settings.maxRetainedImages,
-					maxBytes: this.settings.maxRetainedBytes,
+			const starting = this.dependencies.createService(
+				{
+					conversation,
+					send: (request) => this.sendBrowserMessage(request, generation),
+					imageLimits: this.effectiveImageLimits,
+					sentImageSettings: {
+						enabled: this.settings.retainSentImages,
+						maxImages: this.settings.maxRetainedImages,
+						maxBytes: this.settings.maxRetainedBytes,
+					},
+					processAttachment: (source: Uint8Array, signal?: AbortSignal) =>
+						this.processStagedAttachment(source, generation, signal),
+					controls: {
+						models: async () => this.listSessionModels(),
+						setModel: (provider, id) => this.setSessionModel(provider, id, generation),
+						setThinkingLevel: async (level) => this.setSessionThinkingLevel(level, generation),
+						compact: async () => this.compactSession(generation),
+					},
 				},
-				processAttachment: (source, signal) =>
-					this.processStagedAttachment(source, generation, signal),
-			});
-			this.serverStarting = starting.then(async (server) => {
+				// The browser reaches this session through the hub, so the hub's origin is the one
+				// mutations are checked against.
+				hubBaseUrl().replace(/\/+$/, ""),
+			);
+			this.serverStarting = Promise.resolve(starting).then(async (server) => {
 				if (generation !== this.generation || this.closed || conversation !== this.conversation) {
 					await server.close();
 					throw new Error("the Pi session changed while the server was starting");
@@ -831,6 +926,13 @@ export class WebUIRuntime {
 		}
 
 		const text = request.text;
+		if (isSlashCommand(text)) {
+			if (request.images.length > 0 || (request.attachmentIds?.length ?? 0) > 0) {
+				throw new Error("Slash commands cannot be sent with images.");
+			}
+			const dispatched = await this.dispatchCommand(ctx, generation, text);
+			if (dispatched) return dispatched;
+		}
 		const content: string | Array<TextContent | ImageContent> =
 			images.length === 0
 				? text
@@ -856,6 +958,56 @@ export class WebUIRuntime {
 			throw error;
 		}
 		return { delivery };
+	}
+
+	/**
+	 * Run a slash command the way the terminal does.
+	 *
+	 * Pi dispatches a registered command immediately (no model turn) and expands skill commands and
+	 * prompt templates, so the text goes to Pi unwrapped: browser wrapping would hide the leading
+	 * `/`. Returns undefined when the text is not a command, so `/etc/hosts is wrong` still reaches
+	 * the model as an ordinary message.
+	 */
+	private async dispatchCommand(
+		ctx: ExtensionContext,
+		generation: number,
+		text: string,
+	): Promise<WebSendResult | undefined> {
+		const command = parseSlashCommand(text);
+		if (!command) return undefined;
+		const streaming = !ctx.isIdle() || ctx.hasPendingMessages();
+		if (this.pi.getCommands().some((entry) => entry.name === command.name)) {
+			this.pi.sendUserMessage(text, {
+				expandPromptTemplates: true,
+				deliverAs: streaming ? "followUp" : "steer",
+			});
+			if (generation === this.generation) this.refreshControls(ctx);
+			return { delivery: "command" };
+		}
+		const builtin = BUILTIN_COMMANDS.find((entry) => entry.name === command.name);
+		if (!builtin) return undefined;
+		switch (builtin.support) {
+			case "compact":
+				this.compactSession(generation);
+				return { delivery: "command" };
+			case "name": {
+				const name = command.args.trim();
+				if (!name) throw new Error("Usage: /name <session name>");
+				this.pi.setSessionName(name.slice(0, 120));
+				return { delivery: "command" };
+			}
+			case "thinking": {
+				const requested = command.args.trim().toLowerCase();
+				const levels = THINKING_LEVELS as readonly string[];
+				const next = requested || levels[Math.min(levels.indexOf(this.pi.getThinkingLevel()) + 1, levels.length - 1)];
+				this.setSessionThinkingLevel(next ?? "medium", generation);
+				return { delivery: "command" };
+			}
+			case "models":
+				throw new Error("Use the model menu in the top bar to switch models.");
+			default:
+				throw new Error(`/${command.name} runs in the terminal, not in the browser.`);
+		}
 	}
 
 	private async preflightIdlePrompt(
@@ -944,39 +1096,156 @@ export class WebUIRuntime {
 	 * Publish this session to the hub. The hub only routes requests, so registering cannot affect
 	 * the Pi session itself; when no hub is running the session keeps its own loopback server.
 	 */
-	private async ensureHub(server: ServerControl): Promise<HubClient> {
+	/** Dial the hub. One WebSocket carries this session; nothing here listens for the browser. */
+	private ensureChannel(service: ServerControl): HubChannel {
 		if (this.closed || !this.conversation) throw new Error("the Pi session is not ready");
 		if (this.hub) return this.hub;
 		const generation = this.generation;
-		const client = this.dependencies.createHubClient({
-			metadata: () => this.hubMetadata(server.port),
+		const channel = this.dependencies.createChannel({
+			session: () => this.hubSessionInfo(),
+			serve: (request, response) => service.serve(request, response),
 			onChange: (status) => {
 				if (generation === this.generation && !this.closed) this.hubStatus = status;
 			},
 		});
-		this.hub = client;
-		this.hubStatus = await client.start();
-		if (generation !== this.generation || this.closed) {
-			await client.stop();
-			if (this.hub === client) this.hub = undefined;
-		}
-		return client;
+		this.hub = channel;
+		// Status arrives through `onChange`; taking `start()`'s return value would race the handshake.
+		this.hubStatus = channel.statusSnapshot();
+		channel.start();
+		return channel;
 	}
 
-	private async releaseHub(): Promise<void> {
+	private releaseHub(): void {
 		const hub = this.hub;
 		this.hub = undefined;
-		if (hub) await hub.stop();
+		hub?.stop();
+		this.hubStatus = idleChannelStatus();
 	}
 
-	private hubMetadata(port: number): HubRegistration {
+	/** The session-level state the top bar shows. */
+	private readControls(ctx: ExtensionContext): SessionControls {
+		const model = ctx.model;
+		let usage: ContextUsage | undefined;
+		let activeTools = 0;
+		let totalTools = 0;
+		let thinkingLevel: string | undefined;
+		try {
+			usage = ctx.getContextUsage();
+			activeTools = this.pi.getActiveTools().length;
+			totalTools = this.pi.getAllTools().length;
+			thinkingLevel = this.pi.getThinkingLevel();
+		} catch {
+			// A partial or shutting-down context may not answer; the top bar just omits the chips.
+		}
+		return {
+			...(model
+				? { model: { provider: model.provider, id: model.id, ...(model.name ? { name: model.name } : {}) } }
+				: {}),
+			...(thinkingLevel ? { thinkingLevel } : {}),
+			...(usage
+				? { context: { tokens: usage.tokens, percent: usage.percent, contextWindow: usage.contextWindow } }
+				: {}),
+			...(totalTools > 0 ? { tools: { active: activeTools, total: totalTools } } : {}),
+			commands: this.commandList(),
+		};
+	}
+
+	private refreshControls(ctx: ExtensionContext): void {
+		if (!this.conversation) return;
+		try {
+			this.conversation.updateControls(this.readControls(ctx));
+		} catch {
+			// The controls are decoration; a failure must never break the transcript.
+		}
+	}
+
+	/** Everything the composer can offer under `/`: Pi's commands plus the built-ins we implement. */
+	private commandList(): PublicCommand[] {
+		const commands: PublicCommand[] = [];
+		try {
+			for (const command of this.pi.getCommands()) {
+				commands.push({
+					name: command.name,
+					...(command.description ? { description: command.description } : {}),
+					source: command.source,
+					supported: true,
+				});
+			}
+		} catch {
+			// No command list is better than no page.
+		}
+		const known = new Set(commands.map((command) => command.name));
+		for (const builtin of BUILTIN_COMMANDS) {
+			if (known.has(builtin.name)) continue;
+			commands.push({
+				name: builtin.name,
+				description: builtin.description,
+				source: "builtin",
+				supported: builtin.support !== "terminal",
+			});
+		}
+		return commands;
+	}
+
+	/** Choose the model for this session only; the configured default stays untouched. */
+	private async setSessionModel(provider: string, id: string, generation: number): Promise<void> {
+		const ctx = this.context;
+		if (!ctx || this.closed || generation !== this.generation) throw new Error("The Pi session has ended.");
+		const model = ctx.modelRegistry.find(provider, id);
+		if (!model) throw new Error(`Unknown model "${provider}/${id}".`);
+		if (!(await this.pi.setModel(model))) {
+			throw new Error(`"${provider}/${id}" has no configured authentication.`);
+		}
+		this.refreshControls(ctx);
+		this.publishSessionInfo();
+	}
+
+	private setSessionThinkingLevel(level: string, generation: number): void {
+		const ctx = this.context;
+		if (!ctx || this.closed || generation !== this.generation) throw new Error("The Pi session has ended.");
+		if (!(THINKING_LEVELS as readonly string[]).includes(level)) {
+			throw new Error(`Unknown thinking level "${level}".`);
+		}
+		this.pi.setThinkingLevel(level as (typeof THINKING_LEVELS)[number]);
+		this.refreshControls(ctx);
+	}
+
+	private compactSession(generation: number): void {
+		const ctx = this.context;
+		if (!ctx || this.closed || generation !== this.generation) throw new Error("The Pi session has ended.");
+		ctx.compact();
+	}
+
+	/** Models this session can switch to: the scoped set when configured, else everything usable. */
+	private listSessionModels(): Array<{ provider: string; id: string; name?: string }> {
+		const ctx = this.context;
+		if (!ctx) return [];
+		const scoped = ctx.scopedModels;
+		const models = scoped.length > 0 ? scoped.map((entry) => entry.model) : ctx.modelRegistry.getAvailable();
+		const seen = new Set<string>();
+		const options: Array<{ provider: string; id: string; name?: string }> = [];
+		for (const model of models) {
+			const key = `${model.provider}/${model.id}`;
+			if (seen.has(key)) continue;
+			seen.add(key);
+			options.push({ provider: model.provider, id: model.id, ...(model.name ? { name: model.name } : {}) });
+		}
+		return options.sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
+	}
+
+	/** Tell the hub what changed: activity, name, or model. */
+	private publishSessionInfo(): void {
+		if (!this.hub || this.closed) return;
+		this.hub.setSession(this.hubSessionInfo());
+	}
+
+	private hubSessionInfo(): HubSessionInfo {
 		const ctx = this.context;
 		const snapshot = this.conversation?.snapshot();
 		const activity = snapshot?.activity === "running" ? "running" : snapshot ? "idle" : "unknown";
 		const version = packageVersion();
 		return {
 			sessionId: snapshot?.session.id ?? ctx?.sessionManager.getSessionId() ?? "unknown",
-			port,
 			activity,
 			...(snapshot?.session.cwd ? { cwd: snapshot.session.cwd } : {}),
 			...(snapshot?.session.projectName ? { projectName: snapshot.session.projectName } : {}),
@@ -994,7 +1263,7 @@ export class WebUIRuntime {
 		const starting = this.serverStarting;
 		this.server = undefined;
 		this.serverStarting = undefined;
-		await this.releaseHub();
+		this.releaseHub();
 		if (server) await server.close();
 		if (starting) {
 			try {
@@ -1004,6 +1273,17 @@ export class WebUIRuntime {
 			}
 		}
 	}
+}
+
+/** `/<name> [args]`, or undefined when the text merely starts with a slash. */
+function parseSlashCommand(text: string): { name: string; args: string } | undefined {
+	const match = /^\/([A-Za-z0-9:_-]{1,64})(?:\s+([\s\S]*))?$/.exec(text.trim());
+	if (!match) return undefined;
+	return { name: match[1] as string, args: match[2] ?? "" };
+}
+
+function isSlashCommand(text: string): boolean {
+	return text.startsWith("/");
 }
 
 function parseBrowserInput(text: string): { nonce: string } | undefined {
@@ -1099,10 +1379,16 @@ function hubSettingsLine(): string {
 	return `port ${port}, ${extras} allowed host name${extras === 1 ? "" : "s"} from ${safeTerminalText(read.path)}`;
 }
 
-function hubStatusLine(status: HubClientStatus): string {
-	if (status.state === "registered") return `registered at ${status.hubUrl}`;
-	if (status.state === "unreachable") return `unreachable at ${status.hubUrl} (${status.lastError ?? "no response"})`;
-	return `disabled at ${status.hubUrl}`;
+function idleChannelStatus(): ChannelStatus {
+	const hubUrl = hubBaseUrl();
+	return { state: "closed", hubUrl, channelUrl: channelUrl(hubUrl), protocol: HUB_PROTOCOL };
+}
+
+function hubStatusLine(status: ChannelStatus): string {
+	if (status.state === "connected") return `connected to ${status.hubUrl}`;
+	if (status.state === "closed") return `not started (${status.hubUrl})`;
+	const detail = status.error ? `: ${status.error}` : "";
+	return `${status.state === "connecting" ? "connecting to" : "waiting for"} ${status.hubUrl}${detail}`;
 }
 
 function formatError(error: unknown): string {

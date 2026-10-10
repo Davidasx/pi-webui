@@ -2,9 +2,9 @@ export type WebUIMenuAction = "open" | "settings" | "repair" | "status" | "help"
 
 export interface WebUIMenuState {
 	serverRunning: boolean;
-	hubState: "disabled" | "registered" | "unreachable";
+	hubState: "connected" | "connecting" | "waiting" | "closed";
 	hubUrl: string;
-	sessionUrl?: string;
+	channelUrl?: string;
 	startupAutomatic: boolean;
 	settingsSource: string;
 	settingsPath: string;
@@ -19,7 +19,7 @@ export interface WebUIMenuItem {
 
 export function webUIMenuItems(state: WebUIMenuState): WebUIMenuItem[] {
 	const primary: WebUIMenuItem =
-		state.hubState === "registered"
+		state.hubState === "connected"
 			? {
 					value: "open",
 					label: "Open WebUI",
@@ -27,8 +27,8 @@ export function webUIMenuItems(state: WebUIMenuState): WebUIMenuItem[] {
 				}
 			: {
 					value: "open",
-					label: "Open WebUI (hub offline)",
-					description: `The hub at ${safeTerminalText(state.hubUrl)} is not reachable; this uses a session-only link and prints the hub service setup.`,
+					label: "Open WebUI (waiting for the hub)",
+					description: `The hub at ${safeTerminalText(state.hubUrl)} is not answering; this session reconnects on its own and prints the hub service setup.`,
 				};
 	const settings: WebUIMenuItem = state.settingsInvalid
 		? {
@@ -84,8 +84,9 @@ export function safeTerminalText(value: unknown): string {
 }
 
 function hubLabel(state: WebUIMenuState): string {
-	if (state.hubState === "registered") return safeTerminalText(state.sessionUrl ?? state.hubUrl);
-	return state.hubState === "unreachable" ? "offline" : "disabled";
+	if (state.hubState === "connected") return safeTerminalText(state.hubUrl);
+	if (state.hubState === "closed") return "not started";
+	return state.hubState === "connecting" ? "connecting" : "waiting";
 }
 
 function startupLabel(state: WebUIMenuState): string {

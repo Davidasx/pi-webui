@@ -9,7 +9,7 @@ import {
 
 const STOPPED: WebUIMenuState = {
 	serverRunning: false,
-	hubState: "unreachable",
+	hubState: "waiting",
 	hubUrl: "http://127.0.0.1:43118/",
 	startupAutomatic: false,
 	settingsSource: "Defaults",
@@ -19,8 +19,8 @@ const STOPPED: WebUIMenuState = {
 
 test("menu keeps primary state and selected effects in its declarative items", () => {
 	assert.match(webUIMenuTitle(STOPPED), /Server: Stopped/);
-	assert.match(webUIMenuTitle(STOPPED), /Hub: offline/);
-	assert.match(webUIMenuItems(STOPPED)[0]?.label ?? "", /hub offline/i);
+	assert.match(webUIMenuTitle(STOPPED), /Hub: waiting/);
+	assert.match(webUIMenuItems(STOPPED)[0]?.label ?? "", /waiting for the hub/i);
 	assert.match(webUIMenuItems(STOPPED)[0]?.description ?? "", /43118/);
 });
 
@@ -29,13 +29,13 @@ test("menu previews the hub link, preserves selection, and cancels without an ac
 		...STOPPED,
 		serverRunning: true,
 		startupAutomatic: true,
-		hubState: "registered" as const,
-		sessionUrl: "http://127.0.0.1:43118/s/demo/",
+		hubState: "connected" as const,
+		channelUrl: "ws://127.0.0.1:43118/_hub/channel",
 	};
 	const items = webUIMenuItems(running);
 	assert.equal(items[0]?.label, "Open WebUI");
 	assert.match(items[0]?.description ?? "", /43118/);
-	assert.match(webUIMenuTitle(running), /Hub: http:\/\/127\.0\.0\.1:43118\/s\/demo\//);
+	assert.match(webUIMenuTitle(running), /Hub: http:\/\/127\.0\.0\.1:43118\//);
 	assert.match(
 		items.find((item) => item.value === "status")?.description ?? "",
 		/Review effective startup/,

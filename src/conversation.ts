@@ -2,6 +2,37 @@ const MAX_TEXT_BYTES = 50_000;
 const MAX_TRANSCRIPT_RECORDS = 500;
 const DEFAULT_REPLAY_LIMIT = 256;
 
+export interface PublicCommand {
+	name: string;
+	description?: string;
+	source: "extension" | "prompt" | "skill" | "builtin";
+	/** True when the browser can run the command itself; builtins we do not implement are false. */
+	supported: boolean;
+}
+
+export interface PublicModelRef {
+	provider: string;
+	id: string;
+	name?: string;
+}
+
+export interface PublicContextUsage {
+	tokens: number | null;
+	percent: number | null;
+	contextWindow: number;
+}
+
+/** Session-level state the top bar shows: what Pi is running, and what it can be asked to do. */
+export interface SessionControls {
+	model?: PublicModelRef;
+	thinkingLevel?: string;
+	context?: PublicContextUsage;
+	tools?: { active: number; total: number };
+	commands: PublicCommand[];
+}
+
+export const EMPTY_CONTROLS: SessionControls = { commands: [] };
+
 export interface SessionDescriptor {
 	id: string;
 	cwd: string;
@@ -46,6 +77,7 @@ export interface ConversationSnapshot {
 	tools: PublicTool[];
 	activity: ActivityState;
 	closed: boolean;
+	controls: SessionControls;
 }
 
 export interface ConversationEvent {
@@ -64,12 +96,15 @@ export class ConversationProjection {
 	private readonly listeners = new Set<Listener>();
 	private activity: ActivityState = "idle";
 	private closed = false;
+	private controls: SessionControls = clone(EMPTY_CONTROLS);
 
 	constructor(
 		private readonly session: SessionDescriptor,
 		initialMessages: PublicMessage[] = [],
 		private readonly replayLimit = DEFAULT_REPLAY_LIMIT,
+		controls: SessionControls = EMPTY_CONTROLS,
 	) {
+		this.controls = clone(controls);
 		for (const message of initialMessages.slice(-MAX_TRANSCRIPT_RECORDS)) {
 			this.messages.set(message.id, clone(message));
 		}
@@ -83,6 +118,7 @@ export class ConversationProjection {
 			tools: [...this.tools.values()].map(clone),
 			activity: this.activity,
 			closed: this.closed,
+			controls: clone(this.controls),
 		};
 	}
 
@@ -113,6 +149,13 @@ export class ConversationProjection {
 		if (this.session.name === patch.name) return;
 		if (patch.name === undefined) delete this.session.name;
 		else this.session.name = patch.name;
+		this.publishSnapshot();
+	}
+
+	updateControls(patch: Partial<SessionControls>): void {
+		const next = { ...this.controls, ...clone(patch) };
+		if (JSON.stringify(next) === JSON.stringify(this.controls)) return;
+		this.controls = next;
 		this.publishSnapshot();
 	}
 

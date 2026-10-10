@@ -8,16 +8,18 @@ A private browser view of the Pi session that is running in your terminal, share
 fixed port across all of your Pi sessions.
 
 This is a port of [`narumiruna/pi-extensions/deprecated/pi-webui`](https://github.com/narumiruna/pi-extensions/tree/main/deprecated/pi-webui)
-(MIT, archived upstream) with three deliberate changes:
+(MIT, archived upstream) with four deliberate changes:
 
-1. **No authentication.** The session server and the hub are loopback-only and answer directly:
-   open `http://127.0.0.1:43118/` and you are in. Remote access is the operator's job — put your
-   own access control (for example Cloudflare Zero Trust) in front of the hub.
-2. **One fixed port for every session.** A small hub service owns the port and routes requests to
-   the Pi session that owns each page, so `/s/<sessionId>/` addresses a session.
-3. **The hub is a router, never an agent host.** The hub never opens, reads, or writes a Pi
-   session; it only forwards HTTP and server-sent events between the browser and the sessions that
-   registered with it.
+1. **No authentication.** The hub is loopback-only and answers directly: open
+   `http://127.0.0.1:43118/` and you are in. Remote access is the operator's job — put your own
+   access control (for example Cloudflare Zero Trust) in front of the hub.
+2. **Exactly one port, whatever the number of sessions.** The hub owns the page, the bundle, and
+   the web API; each Pi session holds one WebSocket to the hub and nothing listens inside the Pi
+   process. Ten sessions cost ten connections, not ten servers.
+3. **The hub is a router, never an agent host.** It never opens, reads, or writes a Pi session; it
+   forwards the browser's requests to whichever session owns the page.
+4. **A UI change needs only a hub restart.** The page and its bundle are served by the hub, so
+   editing the interface never requires reloading every Pi session.
 
 ## Why this design does not fight with the terminal
 
@@ -124,15 +126,24 @@ Then open the printed URL, or browse the index at <http://127.0.0.1:43118/>:
 
 - `/` lists every live session (project, model, idle/running, age, path) and updates over
   server-sent events — no page reloads, so scroll position and focus survive.
-- `/s/<sessionId>/` is that session's chat page: transcript, streaming assistant text, tool
-  activity, errors, and a composer that sends text plus sanitized images.
+- `/?session=<sessionId>` is that session's chat page (the same URL shape `agegr/pi-web` uses):
+  transcript, streaming assistant text, collapsible tool cards, thinking blocks, errors, and a
+  composer that sends text plus sanitized images.
+- The top bar mirrors Pi's own controls: **model** (any model this session may use, 500+ here, with a
+  filter), **thinking level**, **context usage**, **active/total tools**, **compact**, and the
+  connection state. Each one is the same API the terminal uses, so nothing is a web-only shim.
+- **Slash commands work.** Type `/` in the composer for the list: registered extension commands
+  (`/webui …`), skill commands, prompt templates, plus the built-ins this page implements
+  (`/compact`, `/name`, `/thinking`). A registered command is dispatched by Pi itself — it never
+  reaches the model as prose — and a built-in the browser cannot run says so instead of silently
+  sending text.
 - The first tab to open a session holds the editing lease; other tabs stay readable and are marked
   read-only.
 - While Pi is idle the composer sends immediately; while Pi is working it offers **Queue next**
   (follow-up) and **Steer**.
 
-If the hub is not running, `/webui open` says so and falls back to a session-only link on an
-ephemeral port, so the extension stays useful without the service.
+If the hub is not running, `/webui open` says so; the session keeps trying and shows the page the
+moment the hub answers, so a hub restart needs no session action.
 
 ## Security model
 
@@ -141,10 +152,11 @@ ephemeral port, so the extension stays useful without the service.
 - **Host validation.** The hub answers only for `127.0.0.1`, `localhost`, `::1`, plus any hostname
   in `hub.allowedHosts`. Anything else gets `421`, which also blocks DNS-rebinding attempts.
 - **Origin validation.** Session-scoped mutations must arrive with the session's own origin; the hub
-  restates a validated browser origin as the session origin when it proxies, so a page on another
-  origin (including a hostile web page in your browser) is refused with `403`.
-- **Cross-origin control-plane writes are blocked.** `/_hub/register|heartbeat|unregister` require a
-  JSON content type, which a cross-origin page cannot send without a preflight the hub never answers.
+  passes the browser's origin on only after checking it against its own Host header, so a page on
+  another origin (including a hostile web page in your browser) is refused with `403`.
+- **The channel is loopback and same-host.** Only a process on this machine can open a channel, and
+  the hub refuses an upgrade whose Host it does not serve. A session can therefore only be reached
+  through the hub, never by a page that merely guesses a port.
 - **Served pages carry a strict CSP** with a per-response nonce; the session page keeps its own
   nonce-based policy (no CDN, no remote service, no browser storage).
 - **Remote access is yours to add.** Front the hub with a tunnel or reverse proxy that does
@@ -189,9 +201,9 @@ processes read this file the same way, so changing `hub.port` needs no systemd e
 systemctl --user restart pi-webui-hub.service
 ```
 
-Running sessions follow a port change on their own: the extension re-reads the file after a failed
-heartbeat. `/webui status` prints the effective port, where it came from, and the file path;
-`/webui settings` edits the port in place.
+Running sessions follow a port change on their own: the channel drops, the extension re-reads the
+file, and the next retry lands on the new port. `/webui status` prints the effective port, where it
+came from, the channel URL, and the file path; `/webui settings` edits the port in place.
 
 For debugging, the hub also accepts `--port <port>` and `--host <host>` flags that override the file
 for that one run. The extension always reads the file, so a temporary `--port` is only useful with
@@ -208,23 +220,38 @@ port instead of refusing to run.
 
 | Endpoint | Method | Purpose |
 | --- | --- | --- |
-| `/_hub/hello` | `GET` | Hub identity and protocol version |
-| `/_hub/sessions` | `GET` | Current registry as JSON |
-| `/_hub/events` | `GET` | SSE stream of registry snapshots (`event: sessions`) |
-| `/_hub/register` | `POST` | Announce a session (session id, loopback port, token, metadata) |
-| `/_hub/heartbeat` | `POST` | Refresh the registration and metadata |
-| `/_hub/unregister` | `POST` | Remove the registration (best effort; entries also expire) |
-| `/s/<sessionId>/**` | any | Proxied to the owning session with the prefix stripped |
+| `/_hub/hello` | `GET` | Hub identity, protocol version, and the channel path |
+| `/_hub/sessions` | `GET` | Current session list as JSON |
+| `/_hub/events` | `GET` | SSE stream of session-list snapshots (`event: sessions`) |
+| `/_hub/channel` | WebSocket | Where a session's extension dials in (protocol 2) |
+| `/?session=<sessionId>` | `GET` | The app shell; the page reads its session from the query string |
+| `/app.{js,css}` | `GET` | The UI bundle, served once by the hub for every session |
+| `/api/session/<sessionId>/**` | any | Forwarded to the owning session over its channel |
+| `/s/<sessionId>/…` | — | Legacy printed link: redirects to `/?session=<sessionId>` |
 
-Registrations expire after roughly 40s without a heartbeat, and stay routable through a grace period
-so a brief stall never blanks an open tab. A restarted hub is repopulated by the next heartbeat —
-sessions do not need to restart.
+The channel carries JSON control frames plus binary bodies for the request and the response, so a
+tunnelled server-sent-event stream and an image upload share one connection. Three consequences
+worth knowing:
+
+- **A session is listed exactly while it is connected.** There is no heartbeat and no registration:
+  connect = listed, disconnect = marked reconnecting for a 30 s grace period (so a hub restart does
+  not blank a tab), then forgotten.
+- **A restarted hub repopulates itself** as the extensions redial, and nothing else needs to change:
+  the socket path comes from the same configuration file the port does.
+- **A session with no channel answers with a reconnecting page** instead of a proxy error, and keeps
+  its requests queued for a few seconds while the extension comes back.
+
+## Interface
+
+The visual design — the palette, the markdown rules, the tool cards, the thinking blocks, and the
+composer — is ported from [`agegr/pi-web`](https://github.com/agegr/pi-web) (MIT). Only the
+presentation is shared; the data comes from this session's own extension through the hub.
 
 ## Development
 
 ```bash
 npm install
-npm run verify      # biome check + typecheck + 195 tests
+npm run verify      # biome check + bundle freshness + typecheck + tests
 npm run test        # vitest
 npm run check       # biome only
 npm run typecheck   # bundle freshness + tsc --noEmit
@@ -232,10 +259,11 @@ npm run build:web   # rebuild src/web/app.{js,css} with esbuild
 npm run hub         # run the hub in the foreground
 ```
 
-Layout: `src/hub.ts` (router, run directly by Node through type stripping), `src/hub-client.ts`
-(registration/heartbeat), `src/hub-protocol.ts` (shared contract), `src/server.ts` (in-session
-server), `src/runtime.ts` (Pi integration), `src/web/ui/*` (React client, bundled into
-`src/web/app.js`).
+Layout: `src/hub.ts` (the one web server: page, assets, channel registry, tunnel; run directly by
+Node through type stripping), `src/hub-channel.ts` (the extension's WebSocket client, with
+reconnect), `src/hub-protocol.ts` (shared contract), `src/server.ts` (a session's web API, driven by
+the channel and transport-agnostic), `src/runtime.ts` (Pi integration: events, commands, controls),
+`src/web/ui/*` (React client, bundled into `src/web/app.js`).
 
 ## Behind a proxy or tunnel
 

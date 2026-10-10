@@ -32,10 +32,10 @@ test("page hierarchy keeps session context, transcript, and composer in reading 
 
 test("browser client claims a lease, reconnects, and keeps failed drafts through hub-relative paths", () => {
 	assert.match(client, /crypto\.randomUUID\(\)/);
-	assert.match(client, /fetch\("api\/lease"/);
-	assert.match(client, /new EventSource\(`api\/events\?since=\$\{model\.sequence\}`\)/);
-	assert.match(client, /fetch\("api\/messages"/);
-	assert.match(client, /fetch\("api\/draft"/);
+	assert.match(client, /fetch\(api\("lease"\)/);
+	assert.match(client, /new EventSource\(api\(`events\?since=\$\{model\.sequence\}`\)\)/);
+	assert.match(client, /fetch\(api\("messages"\)/);
+	assert.match(client, /fetch\(api\("draft"\)/);
 	assert.match(client, /scheduleDraftSave\(\)/);
 	assert.match(client, /flushDraftText\(\)/);
 	assert.match(client, /acknowledgeDraftText/);
@@ -51,7 +51,10 @@ test("browser client claims a lease, reconnects, and keeps failed drafts through
 	assert.match(client, /STREAM_STALL_MS/);
 	assert.match(client, /void refreshSnapshot\(\).catch\(connectionFailure\)/);
 	assert.doesNotMatch(`${app}\n${client}`, /localStorage|sessionStorage|indexedDB/i);
-	// The hub serves every session under a path prefix, so the client must use relative URLs.
+	// The page lives at the hub root and picks its session with ?session=, so every request is
+	// built from that id instead of a hard-coded absolute URL.
+	assert.match(client, /new URLSearchParams\(window\.location\.search\)\.get\("session"\)/);
+	assert.match(client, /api\/session\/\$\{encodeURIComponent\(sessionId\)\}\//);
 	assert.doesNotMatch(`${app}\n${client}`, /["'`]\/api\//);
 });
 
@@ -77,7 +80,7 @@ test("image input stages uploads with status and recovery", () => {
 	assert.match(client, /new XMLHttpRequest\(\)/);
 	assert.match(client, /request\.upload\.addEventListener\("progress"/);
 	assert.match(client, /X-Pi-Web-Client/);
-	assert.match(client, /"api\/attachments\/reserve"/);
+	assert.match(client, /api\("attachments\/reserve"\)/);
 	assert.match(client, /\/upload\?revision=/);
 	assert.match(client, /\/retry/);
 	assert.match(app, /Paste, drop, or choose images\./);
@@ -94,7 +97,7 @@ test("image input stages uploads with status and recovery", () => {
 	);
 	assert.match(app, /Alt\+ArrowUp Alt\+ArrowDown/);
 	assert.match(app, /Order \{index \+ 1\} of \{model\.images\.length\}/);
-	assert.match(client, /"api\/attachments\/clear"/);
+	assert.match(client, /api\("attachments\/clear"\)/);
 	assert.doesNotMatch(`${app}\n${client}`, /URL\.createObjectURL|URL\.revokeObjectURL/);
 });
 
@@ -111,8 +114,8 @@ test("drag ordering gives directional feedback and updates before request settle
 
 test("sent-image actions stay contextual and distinguish expiration", () => {
 	assert.match(client, /events\.addEventListener\("sent-images"/);
-	assert.match(client, /"api\/sent-images\/reattach"/);
-	assert.match(client, /api\/sent-images\/\$\{encodeURIComponent\(retainedImageId\)\}/);
+	assert.match(client, /api\("sent-images\/reattach"\)/);
+	assert.match(client, /api\(`sent-images\/\$\{encodeURIComponent\(retainedImageId\)\}/);
 	assert.match(app, /Attach again/);
 	assert.match(app, /Forget/);
 	assert.match(app, /Expired/);
@@ -131,12 +134,13 @@ test("tool, thinking, and Markdown rendering remain safe", () => {
 	);
 });
 
-test("responsive and accessibility styling covers focus, targets, reflow, and motion", () => {
-	assert.match(styles, /min-width:\s*280px/);
-	assert.match(styles, /min-height:\s*44px/);
-	assert.match(styles, /@media \(max-width: 640px\)/);
-	assert.match(styles, /@media \(prefers-reduced-motion: reduce\)/);
+test("the ported stylesheet keeps the transcript readable and theme-aware", () => {
+	assert.match(styles, /--chat-content-max-width:\s*820px/);
+	assert.match(styles, /--chat-content-font-size:\s*14px/);
+	assert.match(styles, /prefers-color-scheme: dark/);
 	assert.match(styles, /overflow-wrap:\s*anywhere/);
-	assert.match(styles, /max-width:\s*100%/);
-	assert.match(styles, /grid-template-columns:\s*68px fit-content\(14rem\) auto/);
+	assert.match(styles, /white-space:\s*pre-wrap/);
+	assert.match(styles, /\.tool\.failed/);
+	assert.match(styles, /\.thinking-text/);
+	assert.match(styles, /max-width:\s*var\(--chat-content-max-width\)/);
 });

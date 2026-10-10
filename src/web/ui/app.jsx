@@ -12,6 +12,7 @@ import {
 	FileTextIcon,
 	ImageIcon,
 	InfoCircledIcon,
+	LightningBoltIcon,
 	PaperPlaneIcon,
 	ReloadIcon,
 	StopwatchIcon,
@@ -25,6 +26,7 @@ import {
 	Card,
 	Code,
 	Container,
+	DropdownMenu,
 	Flex,
 	Heading,
 	IconButton,
@@ -268,11 +270,145 @@ function App() {
 	);
 }
 
+/** Pi's own controls: model, thinking level, context usage, tool count, compaction. */
+function SessionControls({ controls, disabled }) {
+	const session = controls ?? {};
+	const model = session.model;
+	const percent = session.context?.percent;
+	const tokens = session.context?.tokens;
+	const window = session.context?.contextWindow;
+	return (
+		<Flex align="center" className="session-controls-chips" gap="2">
+			<ModelPicker current={model} disabled={disabled} />
+			<DropdownMenu.Root>
+				<DropdownMenu.Trigger>
+					<Button className="chip" color="gray" disabled={disabled} size="2" variant="soft" id="thinking-level">
+						<LightningBoltIcon />
+						{session.thinkingLevel ?? "thinking"}
+						<ChevronDownIcon />
+					</Button>
+				</DropdownMenu.Trigger>
+				<DropdownMenu.Content align="end" sideOffset={6}>
+					{THINKING_LEVELS.map((level) => (
+						<DropdownMenu.Item key={level} onSelect={() => void webClient.setThinkingLevel(level)}>
+							{level}
+							{level === session.thinkingLevel ? " ✓" : ""}
+						</DropdownMenu.Item>
+					))}
+				</DropdownMenu.Content>
+			</DropdownMenu.Root>
+			<Tooltip.Root>
+				<Tooltip.Trigger asChild>
+					<Badge className="chip" color={percentColor(percent)} id="context-usage" variant="soft">
+						{percent === null || percent === undefined ? "—" : `${Math.round(percent)}%`}
+					</Badge>
+				</Tooltip.Trigger>
+				<Tooltip.Content sideOffset={6}>{contextDetail(tokens, window)}</Tooltip.Content>
+			</Tooltip.Root>
+			{session.tools && (
+				<Tooltip.Root>
+					<Tooltip.Trigger asChild>
+						<Badge className="chip" color="gray" id="tool-count" variant="soft">
+							{session.tools.active}/{session.tools.total}
+						</Badge>
+					</Tooltip.Trigger>
+					<Tooltip.Content sideOffset={6}>
+						{session.tools.active} of {session.tools.total} tools are active
+					</Tooltip.Content>
+				</Tooltip.Root>
+			)}
+			<Tooltip.Root>
+				<Tooltip.Trigger asChild>
+					<IconButton
+						aria-label="Compact the session context"
+						color="gray"
+						disabled={disabled}
+						id="compact-session"
+						onClick={() => void webClient.compactSession()}
+						variant="ghost"
+					>
+						<ReloadIcon />
+					</IconButton>
+				</Tooltip.Trigger>
+				<Tooltip.Content sideOffset={6}>Compact the session context</Tooltip.Content>
+			</Tooltip.Root>
+		</Flex>
+	);
+}
+
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+function percentColor(percent) {
+	if (percent === null || percent === undefined) return "gray";
+	if (percent >= 90) return "red";
+	if (percent >= 70) return "amber";
+	return "jade";
+}
+
+function contextDetail(tokens, window) {
+	if (typeof tokens !== "number" || !window) return "Context usage is not known yet";
+	return `${tokens.toLocaleString()} of ${window.toLocaleString()} tokens`;
+}
+
+function ModelPicker({ current, disabled }) {
+	const [query, setQuery] = useState("");
+	const models = webClient.availableModels();
+	const label = current ? (current.name ?? current.id) : "model";
+	const matching = useMemo(() => {
+		const needle = query.trim().toLowerCase();
+		if (!needle) return models;
+		return models.filter((model) =>
+			`${model.provider}/${model.id} ${model.name ?? ""}`.toLowerCase().includes(needle),
+		);
+	}, [models, query]);
+	return (
+		<DropdownMenu.Root
+			onOpenChange={(open) => {
+				if (!open) setQuery("");
+				else void webClient.loadModels();
+			}}
+		>
+			<DropdownMenu.Trigger>
+				<Button className="chip" color="gray" disabled={disabled} id="model-name" size="2" variant="soft">
+					{label}
+					<ChevronDownIcon />
+				</Button>
+			</DropdownMenu.Trigger>
+			<DropdownMenu.Content align="end" className="model-menu" sideOffset={6}>
+					<span className="model-menu-header">Switch model for this session</span>
+					<input
+						aria-label="Filter models"
+						className="model-menu-filter"
+						onChange={(event) => setQuery(event.target.value)}
+						placeholder="Filter models…"
+						value={query}
+					/>
+				{matching.length === 0 && (
+					<Text as="p" color="gray" size="1">
+						{matching.length === 0 && query ? "No model matches." : "Loading models…"}
+					</Text>
+				)}
+				{matching.slice(0, 200).map((model) => (
+					<DropdownMenu.Item
+						key={`${model.provider}/${model.id}`}
+						onSelect={() => void webClient.setModel(model.provider, model.id)}
+					>
+						<span className="model-option">
+							<span className="model-option-name">{model.name ?? model.id}</span>
+							<span className="model-option-provider">{model.provider}</span>
+						</span>
+					</DropdownMenu.Item>
+				))}
+			</DropdownMenu.Content>
+		</DropdownMenu.Root>
+	);
+}
+
 function SessionHeader({ model }) {
 	return (
 		<header className="session-header">
 			<Container size="3" px={{ initial: "3", sm: "5" }}>
-				<Flex className="session-header-content">
+				<Flex align="center" className="session-header-content">
 					<Box className="session-identity">
 						<Text as="p" className="eyebrow" color="jade" size="1" weight="bold">
 							Pi WebUI
@@ -285,6 +421,7 @@ function SessionHeader({ model }) {
 						</Text>
 					</Box>
 					<Flex align="center" className="session-controls" gap="2">
+						<SessionControls controls={model.controls} disabled={model.stale || model.closed} />
 						<Badge color={connectionColor(model)} id="connection-status" role="status" size="2">
 							{model.activity === "running" && !model.stale && !model.closed ? (
 								<Spinner size="1" />
@@ -377,18 +514,18 @@ const Message = memo(function Message({ message, onForget, retained, tools }) {
 					tool={tools.get(block.id)}
 				/>
 			))}
-			{message.errorMessage && (
-				<Callout.Root color="red" role="alert" size="1" variant="soft">
-					<Callout.Icon>
-						<ExclamationTriangleIcon />
-					</Callout.Icon>
-					<Callout.Text>{message.errorMessage}</Callout.Text>
-				</Callout.Root>
-			)}
+			{message.errorMessage && <Box className="message-error">{message.errorMessage}</Box>}
 		</Box>
 	);
+	const header = (
+		<Flex align="center" className="message-header">
+			<span>{roleLabel(message)}</span>
+			{typeof message.timestamp === "number" && <span>{clockTime(message.timestamp)}</span>}
+			<CopyButton label="Copy message" text={messageText(message)} />
+		</Flex>
+	);
 	return (
-		<Box asChild className={`message ${role}`}>
+		<Box asChild className={`message ${role}`} data-message-id={message.id}>
 			<li>
 				{isCollapsibleMessageRole(message.role) ? (
 					<Collapsible.Root className="message-disclosure">
@@ -401,9 +538,7 @@ const Message = memo(function Message({ message, onForget, retained, tools }) {
 					</Collapsible.Root>
 				) : (
 					<>
-						<Text as="div" className="message-heading" color="gray" size="1" weight="bold">
-							{roleLabel(message)}
-						</Text>
+						{header}
 						{body}
 					</>
 				)}
@@ -411,6 +546,44 @@ const Message = memo(function Message({ message, onForget, retained, tools }) {
 		</Box>
 	);
 }, messagePropsEqual);
+
+/** A small copy affordance: the transcript is meant to be quotable. */
+function CopyButton({ label, text }) {
+	const [copied, setCopied] = useState(false);
+	if (!text) return null;
+	return (
+		<button
+			aria-label={label}
+			className="markdown-code-action"
+			onClick={() => {
+				void navigator.clipboard?.writeText(text).then(() => {
+					setCopied(true);
+					setTimeout(() => setCopied(false), 1200);
+				});
+			}}
+			type="button"
+		>
+			{copied ? "Copied" : "Copy"}
+		</button>
+	);
+}
+
+/** Everything a message says, for the copy button. */
+function messageText(message) {
+	return (message.content ?? [])
+		.map((block) => {
+			if (block.type === "text" || block.type === "thinking") return block.text;
+			if (block.type === "toolCall") return `${block.name} ${safeJson(block.arguments)}`;
+			return "";
+		})
+		.filter(Boolean)
+		.join("\n\n");
+}
+
+function clockTime(timestamp) {
+	const date = new Date(timestamp);
+	return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
 
 function messagePropsEqual(previous, next) {
 	if (
@@ -431,25 +604,32 @@ function messagePropsEqual(previous, next) {
 
 function MessageBlock({ block, onForget, retained, tool }) {
 	if (block.type === "text") return <Markdown text={block.text} />;
-	if (block.type === "thinking") {
-		return (
-			<Collapsible.Root className="thinking">
-				<Collapsible.Trigger asChild>
-					<Button color="gray" variant="ghost">
-						<StopwatchIcon /> Thinking <ChevronDownIcon className="disclosure-icon" />
-					</Button>
-				</Collapsible.Trigger>
-				<Collapsible.Content>
-					<pre>{block.text}</pre>
-				</Collapsible.Content>
-			</Collapsible.Root>
-		);
-	}
+	if (block.type === "thinking") return <Thinking text={block.text} />;
 	if (block.type === "toolCall") return <ToolCall call={block} tool={tool} />;
 	if (block.type === "image") {
 		return <SentImageChip block={block} onForget={onForget} retained={retained} />;
 	}
 	return null;
+}
+
+/** Thinking collapses to one dim line, like the terminal's hidden reasoning. */
+function Thinking({ text }) {
+	const [expanded, setExpanded] = useState(false);
+	const preview = text.replace(/\s+/g, " ").trim().slice(0, 200);
+	return (
+		<div className="thinking">
+			<button
+				aria-expanded={expanded}
+				className="thinking-toggle"
+				onClick={() => setExpanded((value) => !value)}
+				type="button"
+			>
+				<StopwatchIcon />
+				{!expanded && <span className="thinking-preview">{preview || "Thinking…"}</span>}
+			</button>
+			{expanded && <div className="thinking-text">{text}</div>}
+		</div>
+	);
 }
 
 const Markdown = memo(function Markdown({ text }) {
@@ -494,9 +674,15 @@ function MarkdownBlock({ block }) {
 	}
 	if (block.type === "codeBlock") {
 		return (
-			<pre className="markdown-code">
-				<code data-language={block.language || undefined}>{block.text}</code>
-			</pre>
+			<div className="markdown-code-block">
+				<div className="markdown-code-header">
+					<span>{block.language || "text"}</span>
+					<CopyButton label="Copy code" text={block.text} />
+				</div>
+				<pre>
+					<code data-language={block.language || undefined}>{block.text}</code>
+				</pre>
+			</div>
 		);
 	}
 	return (
@@ -532,30 +718,51 @@ function MarkdownInline({ nodes }) {
 	});
 }
 
+/**
+ * A tool call: one compact header (name, preview, duration, chevron) over an expandable body with
+ * the arguments and the result, the way the ported design shows them.
+ */
 function ToolCall({ call, tool }) {
+	const [expanded, setExpanded] = useState(false);
+	const failed = Boolean(tool?.isError);
 	const phase = toolPhaseLabel(tool);
-	const command = toolCommandPreview(tool);
+	const preview = toolCommandPreview(tool) || "";
 	const args = safeJson(tool?.args ?? call.arguments);
 	const result = tool?.result === undefined ? "" : safeJson(tool.result);
+	const resultEmpty = result === "" || result === "null" || result === '"(no output)"';
 	return (
-		<Collapsible.Root className={`tool ${tool?.isError ? "failed" : ""}`}>
-			<Card asChild size="1">
-				<Box>
-					<Collapsible.Trigger asChild>
-						<Button className="tool-trigger" color={tool?.isError ? "red" : "gray"} variant="ghost">
-							<CodeIcon />
-							<span>{`${call.name} · ${phase}`}</span>
-							{command && <Code className="tool-command">{command}</Code>}
-							<ChevronDownIcon className="disclosure-icon" />
-						</Button>
-					</Collapsible.Trigger>
-					<Collapsible.Content className="tool-content">
+		<div className={`tool ${failed ? "failed" : ""} ${expanded ? "expanded" : ""}`}>
+			<div className="tool-header">
+				<button
+					aria-expanded={expanded}
+					className="tool-trigger"
+					onClick={() => setExpanded((value) => !value)}
+					type="button"
+				>
+					<span className="tool-name">{call.name}</span>
+					<span className="tool-preview">{preview || phase}</span>
+					<span className="tool-duration">{phase}</span>
+					<ChevronDownIcon className="tool-chevron" />
+				</button>
+				<CopyButton label={`Copy ${call.name} call`} text={`${call.name}(${args})\n\n${result}`} />
+			</div>
+			{expanded && (
+				<div className="tool-body">
+					<div className="tool-section">
+						<div className="tool-section-label">Arguments</div>
 						<pre>{args}</pre>
-						{result && <pre>{result}</pre>}
-					</Collapsible.Content>
-				</Box>
-			</Card>
-		</Collapsible.Root>
+					</div>
+					<div className="tool-section">
+						<div className="tool-section-label">Result</div>
+						{resultEmpty ? (
+							<pre className="tool-empty">{tool ? "(no output)" : "Running…"}</pre>
+						) : (
+							<pre>{result}</pre>
+						)}
+					</div>
+				</div>
+			)}
+		</div>
 	);
 }
 
@@ -616,6 +823,60 @@ function BlockingState({ model }) {
 	);
 }
 
+/** The `/` list: Pi's own commands, skills and templates, plus the built-ins this page implements. */
+function CommandHint({ inputRef, locked, text }) {
+	const commands = webClient.commands();
+	const needle = matchCommandPrefix(text);
+	if (locked || needle === undefined) return null;
+	const matching = commands.filter((command) => command.name.startsWith(needle)).slice(0, 12);
+	if (matching.length === 0) return null;
+	return (
+		<div aria-label="Slash commands" className="command-hint" role="listbox" id="command-hint">
+			{matching.map((command) => (
+				<button
+					className="command-hint-item"
+					key={`${command.source}:${command.name}`}
+					onMouseDown={(event) => {
+						event.preventDefault();
+						applyCommand(command);
+						inputRef.current?.focus();
+					}}
+					role="option"
+					type="button"
+				>
+					<code>/{command.name}</code>
+					<span className="command-hint-description">{command.description ?? command.source}</span>
+					{command.supported ? null : <span className="command-hint-note">terminal</span>}
+				</button>
+			))}
+		</div>
+	);
+}
+
+/** The prefix being typed after `/`, or undefined when the draft is not a command being typed. */
+function matchCommandPrefix(text) {
+	const match = /^\/([A-Za-z0-9:_-]*)$/.exec(text);
+	return match ? (match[1] ?? "") : undefined;
+}
+
+function applyCommand(command) {
+	webClient.editText(command.supported ? `/${command.name} ` : `/${command.name}`);
+}
+
+/** Tab or Enter on a `/` draft fills in the top suggestion instead of sending it. */
+function handleCommandKey(event, text) {
+	const needle = matchCommandPrefix(text);
+	if (needle === undefined || (event.key !== "Tab" && event.key !== "Enter")) return false;
+	const first = webClient
+		.commands()
+		.filter((command) => command.name.startsWith(needle))
+		.at(0);
+	if (!first) return false;
+	event.preventDefault();
+	applyCommand(first);
+	return true;
+}
+
 function Composer({ dragActive, onClear, onPreview, view, ...dropProps }) {
 	const inputRef = useRef();
 	const fileRef = useRef();
@@ -648,22 +909,24 @@ function Composer({ dragActive, onClear, onPreview, view, ...dropProps }) {
 				ref={composerRef}
 				{...dropProps}
 			>
-				<Flex direction="column" gap="3">
-					<Text as="label" htmlFor="message-input" size="2" weight="bold">
+				<Flex className="composer-inner" direction="column">
+					<Text as="label" className="visually-hidden" htmlFor="message-input" size="2">
 						Message Pi
 					</Text>
+					<CommandHint inputRef={inputRef} locked={admissionLocked} text={model.text} />
 					<TextArea
 						aria-label="Message Pi"
 						disabled={model.closed || model.stale}
 						id="message-input"
 						onChange={(event) => webClient.editText(event.target.value)}
 						onKeyDown={(event) => {
+							if (handleCommandKey(event, model.text)) return;
 							if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
 								event.preventDefault();
 								void webClient.send(false);
 							}
 						}}
-						placeholder="Ask Pi to do something…"
+						placeholder="Ask Pi to do something…  Type / for commands, @ to mention a file"
 						ref={inputRef}
 						resize="none"
 						rows={1}

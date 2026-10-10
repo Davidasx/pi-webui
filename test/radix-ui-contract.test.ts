@@ -31,11 +31,11 @@ test("browser source uses the complete Radix UI stack", () => {
 	assert.match(appSource, /@radix-ui\/colors/);
 });
 
-test("HTML is a minimal React shell with bundled local assets and a hub-relative base", () => {
+test("HTML is a minimal React shell that loads the hub's shared assets", () => {
 	assert.match(html, /id="root"/);
-	assert.match(html, /<base href="__PI_BASE_HREF__" \/>/);
-	assert.match(html, /href="app\.css"/);
-	assert.match(html, /src="app\.js"/);
+	assert.match(html, /href="\/app\.css"/);
+	assert.match(html, /src="\/app\.js"/);
+	assert.match(html, /__PI_CSP_NONCE__/);
 	assert.doesNotMatch(html, /<(?:button|textarea|dialog|details|summary)\b/);
 });
 

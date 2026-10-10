@@ -1,35 +1,40 @@
 /**
- * pi-webui hub: a router, not an agent host.
+ * pi-webui hub: the one web server, and a router rather than an agent host.
  *
- * The hub owns the fixed port and nothing else. It keeps a registry of live Pi sessions that
- * registered themselves, serves a small landing page, and proxies every session-scoped request to
- * the in-process web server that lives inside the owning Pi session. It never opens a Pi session,
- * never reads or writes Pi session data, and never constructs an agent runtime, so it cannot
- * compete with a terminal Pi process for session state.
+ * The hub owns the single configured port. It serves the browser UI, and it reaches a Pi session
+ * through a WebSocket that the session's extension dials out on the same port: nothing else listens,
+ * so ten sessions cost ten connections instead of ten servers. The hub never opens a Pi session,
+ * never reads session files, and never constructs an agent runtime, so it cannot compete with a
+ * terminal Pi process for session state.
  *
  * Plain Node TypeScript: this file is executed directly by Node's type stripping
  * (`node src/hub.ts`), so the systemd unit needs no build step.
  */
 
-import { randomBytes, timingSafeEqual } from "node:crypto";
-import { Agent, createServer, type IncomingMessage, request as proxyRequest, type Server, type ServerResponse } from "node:http";
-import { pathToFileURL } from "node:url";
+import { randomBytes } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { type RawData, type WebSocket, WebSocketServer } from "ws";
 
 import {
+	CHANNEL_PATH,
 	CONFIG_FILE_NAME,
 	DEFAULT_HUB_PORT,
 	EVENTS_PATH,
-	HEARTBEAT_PATH,
+	type ExtensionToHubMessage,
 	HELLO_PATH,
 	HUB_NAME,
 	HUB_PROTOCOL,
 	type HubActivity,
-	REGISTER_PATH,
+	type HubSessionInfo,
+	type HubToExtensionMessage,
 	readHubConfig,
 	SESSION_PATH_PREFIX,
 	SESSIONS_PATH,
+	sessionApiTarget,
 	sessionBasePath,
-	UNREGISTER_PATH,
 } from "./hub-protocol.ts";
 
 export type { HubActivity } from "./hub-protocol.ts";
@@ -37,15 +42,16 @@ export { DEFAULT_HUB_PORT, HUB_NAME, HUB_PROTOCOL } from "./hub-protocol.ts";
 
 /** How often open index streams are refreshed, so a silent stream is detectable. */
 const SESSION_TICK_MS = 3_000;
-
-/** How long a registration survives without a heartbeat. */
-const SESSION_TTL_MS = 10_000;
-/** How long an expired session stays routable (so a brief stall does not blank a browser tab). */
+/** How long a browser request waits for a session whose channel is reconnecting. */
+const CHANNEL_WAIT_MS = 3_000;
+/** A channel that stops sending its keep-alive ping for this long is torn down. */
+const CHANNEL_SILENCE_MS = 50_000;
+/** How long a disconnected session stays listed, so a browser keeps its context across a restart. */
 const SESSION_GRACE_MS = 30_000;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
-const TOKEN_PATTERN = /^[a-f0-9]{16,128}$/;
-const MAX_BODY_BYTES = 64 * 1024;
+const MAX_TUNNEL_BYTES = 64 * 1024 * 1024;
 const MAX_SESSIONS = 128;
+/** Headers that describe the hop, not the request: never forwarded to a session. */
 const HOP_BY_HOP = new Set([
 	"connection",
 	"keep-alive",
@@ -57,20 +63,7 @@ const HOP_BY_HOP = new Set([
 	"upgrade",
 ]);
 
-
-export interface HubRegistration {
-	sessionId: string;
-	port: number;
-	token: string;
-	cwd?: string;
-	projectName?: string;
-	name?: string;
-	model?: string;
-	activity?: HubActivity;
-	piVersion?: string;
-	extensionVersion?: string;
-}
-
+/** A session as the hub knows it: metadata from the extension plus connection state. */
 export interface HubSessionSummary {
 	sessionId: string;
 	cwd?: string;
@@ -80,15 +73,39 @@ export interface HubSessionSummary {
 	activity: HubActivity;
 	registeredAt: number;
 	lastSeen: number;
+	/** True while the extension is not connected, so the index can show it as reconnecting. */
 	stale: boolean;
 	url: string;
 }
 
-interface SessionRecord extends HubSessionSummary {
-	port: number;
-	token: string;
-	piVersion?: string;
-	extensionVersion?: string;
+interface SessionRecord {
+	session: HubSessionInfo;
+	registeredAt: number;
+	lastSeen: number;
+	channel?: ChannelConnection;
+	disconnectedAt?: number;
+	waiting?: Array<() => void>;
+}
+
+/** One extension's WebSocket, with the requests the browser is waiting on. */
+interface ChannelConnection {
+	sessionId: string;
+	socket: WebSocket;
+	connectedAt: number;
+	lastPingAt: number;
+	nextRequestId: number;
+	pending: Map<number, PendingRequest>;
+}
+
+interface PendingRequest {
+	/** Browser response, when a browser is waiting; absent for internal calls. */
+	response?: ServerResponse;
+	onChunk?: (chunk: Buffer) => void;
+	onEnd?: () => void;
+	status?: number;
+	headers?: Record<string, string>;
+	/** Body arriving for a request still being assembled (never used for responses). */
+	finish?: (error?: Error) => void;
 }
 
 export interface HubLogger {
@@ -107,7 +124,9 @@ export interface HubOptions {
 	 */
 	env?: NodeJS.ProcessEnv;
 	logger?: HubLogger;
-	ttlMs?: number;
+	/** How long a browser request waits for a reconnecting session before giving up. */
+	channelWaitMs?: number;
+	/** How long a disconnected session stays listed. */
 	graceMs?: number;
 	/**
 	 * How often every open index stream is refreshed even when nothing changed. This keeps the
@@ -115,6 +134,8 @@ export interface HubOptions {
 	 * that buffer or time out idle streams from going silent.
 	 */
 	tickMs?: number;
+	/** How long a silent channel is tolerated before it is terminated. */
+	silenceMs?: number;
 	/**
 	 * Keep the process alive through the listening server. The CLI sets this; tests leave it off so
 	 * they can close a hub deterministically without holding the test runner open.
@@ -184,24 +205,6 @@ function sendHtml(response: ServerResponse, status: number, body: string, nonce:
 	response.end(body);
 }
 
-async function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown> | undefined> {
-	const chunks: Buffer[] = [];
-	let total = 0;
-	for await (const chunk of request) {
-		const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
-		total += buffer.byteLength;
-		if (total > MAX_BODY_BYTES) return undefined;
-		chunks.push(buffer);
-	}
-	if (total === 0) return {};
-	try {
-		const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
-		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
 function optionalString(source: Record<string, unknown>, key: string, max = 200): string | undefined {
 	const value = source[key];
 	if (typeof value !== "string") return undefined;
@@ -209,18 +212,13 @@ function optionalString(source: Record<string, unknown>, key: string, max = 200)
 	return trimmed ? trimmed.slice(0, max) : undefined;
 }
 
-function parseRegistration(source: Record<string, unknown>): HubRegistration | undefined {
-	const sessionId = optionalString(source, "sessionId");
-	const token = optionalString(source, "token");
-	const port = source.port;
+/** Session metadata as a channel announces it. Unknown or malformed fields are dropped. */
+function parseSessionInfo(source: Record<string, unknown>): HubSessionInfo | undefined {
+	const sessionId = optionalString(source, "sessionId", 80);
 	if (!sessionId || !SESSION_ID_PATTERN.test(sessionId)) return undefined;
-	if (!token || !TOKEN_PATTERN.test(token)) return undefined;
-	if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) return undefined;
 	const activity = source.activity;
 	return {
 		sessionId,
-		token,
-		port,
 		...(optionalString(source, "cwd", 4096) ? { cwd: optionalString(source, "cwd", 4096) as string } : {}),
 		...(optionalString(source, "projectName") ? { projectName: optionalString(source, "projectName") as string } : {}),
 		...(optionalString(source, "name") ? { name: optionalString(source, "name") as string } : {}),
@@ -231,13 +229,6 @@ function parseRegistration(source: Record<string, unknown>): HubRegistration | u
 			? { extensionVersion: optionalString(source, "extensionVersion") as string }
 			: {}),
 	};
-}
-
-function secretEqual(a: string, b: string): boolean {
-	const left = Buffer.from(a, "utf8");
-	const right = Buffer.from(b, "utf8");
-	if (left.byteLength !== right.byteLength) return false;
-	return timingSafeEqual(left, right);
 }
 
 function sessionIdFromPath(pathname: string): { sessionId: string; rest: string } | undefined {
@@ -441,23 +432,66 @@ function sessionGonePage(sessionId: string, nonce: string): string {
 <style nonce="${nonce}">body{margin:0;padding:3rem 1.25rem;font:15px/1.6 ui-sans-serif,system-ui,sans-serif;max-width:40rem;margin-inline:auto}
 code{font-family:ui-monospace,Menlo,monospace}</style></head>
 <body><h1>That Pi session is not connected</h1>
-<p>Session <code>${htmlEscape(sessionId.slice(0, 8))}</code> is not registered with this hub right now.
-It may have exited, or the hub may have restarted before the session's next heartbeat.</p>
+<p>Session <code>${htmlEscape(sessionId.slice(0, 8))}</code> is not connected to this hub right now.
+It may have exited, or the hub may have restarted before the session's next reconnect.</p>
 <p><a href="/">Show connected sessions</a></p></body></html>
 `;
+}
+
+/** The session exists but its extension is not answering right now; the page retries on its own. */
+function sessionOfflinePage(sessionId: string, label: string | undefined, nonce: string): string {
+	return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><title>pi-webui</title>
+<style nonce="${nonce}">body{margin:0;padding:3rem 1.25rem;font:15px/1.6 ui-sans-serif,system-ui,sans-serif;max-width:40rem;margin-inline:auto}
+code{font-family:ui-monospace,Menlo,monospace}</style></head>
+<body><h1>${htmlEscape(label ?? "That Pi session")} is reconnecting</h1>
+<p>Session <code>${htmlEscape(sessionId.slice(0, 8))}</code> is listed, but its extension is not
+answering at this moment. This page keeps trying; reload in a moment, or watch the index for the
+session to come back.</p>
+<p><a href="/">Show connected sessions</a></p></body></html>
+`;
+}
+
+const ASSET_TYPES: Record<string, string> = {
+	"app.js": "text/javascript; charset=utf-8",
+	"app.css": "text/css; charset=utf-8",
+};
+
+const PAGE_SECURITY_HEADERS: Record<string, string> = {
+	"Referrer-Policy": "no-referrer",
+	"X-Content-Type-Options": "nosniff",
+	"X-Frame-Options": "DENY",
+	"Cross-Origin-Resource-Policy": "same-origin",
+};
+
+/** Header names are case-insensitive in HTTP; mixing spellings produces duplicate headers. */
+function lowerCaseHeaders(headers: Record<string, string> | undefined): Record<string, string> {
+	const result: Record<string, string> = {};
+	for (const [name, value] of Object.entries(headers ?? {})) result[name.toLowerCase()] = value;
+	return result;
+}
+
+/** Normalize whatever `ws` hands us (Buffer, ArrayBuffer, or a view) into one Buffer. */
+function toBuffer(data: unknown): Buffer {
+	if (Buffer.isBuffer(data)) return data;
+	if (data instanceof ArrayBuffer) return Buffer.from(data);
+	if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+	if (Array.isArray(data)) return Buffer.concat((data as Buffer[]).map((chunk) => Buffer.from(chunk)));
+	return Buffer.from(String(data), "utf8");
 }
 
 export async function startHub(options: HubOptions = {}): Promise<Hub> {
 	const config = readHubConfig({ env: options.env });
 	const host = options.host ?? "127.0.0.1";
-	const ttlMs = options.ttlMs ?? SESSION_TTL_MS;
 	const graceMs = options.graceMs ?? SESSION_GRACE_MS;
+	const channelWaitMs = options.channelWaitMs ?? CHANNEL_WAIT_MS;
+	const silenceMs = options.silenceMs ?? CHANNEL_SILENCE_MS;
 	const allowedHosts = config.config.allowedHosts;
 	const logger = options.logger ?? silentLogger;
+	const webRoot = join(fileURLToPath(new URL(".", import.meta.url)), "web");
 	const sessions = new Map<string, SessionRecord>();
 	/** Open index streams (`/_hub/events`); the landing page subscribes instead of reloading. */
 	const eventClients = new Set<ServerResponse>();
-	const agent = new Agent({ keepAlive: true, keepAliveMsecs: 15_000, maxSockets: 128, scheduling: "lifo" });
 
 	const server: Server = createServer((request, response) => {
 		void handle(request, response).catch((error: unknown) => {
@@ -468,35 +502,64 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 	});
 	server.on("clientError", (_error, socket) => socket.destroy());
 
+	// Extensions dial in here. One upgrade, one session, no listening socket in the Pi process.
+	const channels = new WebSocketServer({ noServer: true });
+	server.on("upgrade", (request, socket, head) => {
+		const hostHeader = request.headers.host;
+		let path = "/";
+		try {
+			path = new URL(request.url ?? "/", `http://${hostHeader ?? "127.0.0.1"}`).pathname;
+		} catch {
+			path = "/";
+		}
+		if (path !== CHANNEL_PATH || !hostAllowed(hostHeader, allowedHosts)) {
+			socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+			socket.destroy();
+			return;
+		}
+		channels.handleUpgrade(request, socket, head, (socket2) => acceptChannel(socket2));
+	});
+
 	function summarize(record: SessionRecord): HubSessionSummary {
-		const now = Date.now();
+		const info = record.session;
 		return {
-			sessionId: record.sessionId,
-			...(record.cwd ? { cwd: record.cwd } : {}),
-			...(record.projectName ? { projectName: record.projectName } : {}),
-			...(record.name ? { name: record.name } : {}),
-			...(record.model ? { model: record.model } : {}),
-			activity: record.activity,
+			sessionId: info.sessionId,
+			...(info.cwd ? { cwd: info.cwd } : {}),
+			...(info.projectName ? { projectName: info.projectName } : {}),
+			...(info.name ? { name: info.name } : {}),
+			...(info.model ? { model: info.model } : {}),
+			activity: info.activity ?? "unknown",
 			registeredAt: record.registeredAt,
 			lastSeen: record.lastSeen,
-			stale: now - record.lastSeen > ttlMs,
-			url: sessionBasePath(record.sessionId),
+			stale: record.channel === undefined,
+			url: sessionBasePath(info.sessionId),
 		};
 	}
 
 	function listSessions(): HubSessionSummary[] {
-		return [...sessions.values()]
-			.sort((a, b) => b.lastSeen - a.lastSeen)
-			.map((record) => summarize(record));
+		return [...sessions.values()].sort((a, b) => b.lastSeen - a.lastSeen).map((record) => summarize(record));
 	}
 
-	function requireSession(body: Record<string, unknown>): { record: SessionRecord; token: string } | undefined {
-		const sessionId = optionalString(body, "sessionId");
-		const token = optionalString(body, "token");
-		if (!sessionId || !token) return undefined;
+	function applySessionInfo(record: SessionRecord, info: HubSessionInfo): void {
+		record.session = { ...record.session, ...info };
+		record.lastSeen = Date.now();
+	}
+
+	/** Resolve a browser request to a session that has a channel, waiting briefly for a reconnect. */
+	async function requireChannel(sessionId: string): Promise<ChannelConnection | undefined> {
 		const record = sessions.get(sessionId);
-		if (!record || !secretEqual(record.token, token)) return undefined;
-		return { record, token };
+		if (!record) return undefined;
+		if (record.channel) return record.channel;
+		const resumed = await new Promise<ChannelConnection | undefined>((resolve) => {
+			const timer = setTimeout(() => resolve(record.channel), channelWaitMs);
+			timer.unref?.();
+			record.waiting ??= [];
+			record.waiting.push(() => {
+				clearTimeout(timer);
+				resolve(record.channel);
+			});
+		});
+		return resumed;
 	}
 
 	async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -516,22 +579,45 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 			return;
 		}
 
-		if (method !== "GET" && method !== "HEAD") {
-			// Session-scoped mutations are proxied below; anything else on the hub origin is refused.
-			if (!sessionIdFromPath(pathname)) {
-				sendJson(response, 405, { error: "Method not allowed" });
-				return;
-			}
-		}
-
 		const nonce = randomBytes(16).toString("base64url");
 		if (pathname === "/" || pathname === "/index.html") {
+			// One page for everything: without `?session=` it lists sessions, with it, it is that
+			// session's chat page. The bundle below is shared by all of them.
+			const selected = url.searchParams.get("session");
+			if (selected && SESSION_ID_PATTERN.test(selected)) {
+				if (!sessions.has(selected)) {
+					sendHtml(response, 404, sessionGonePage(selected, nonce), nonce);
+					return;
+				}
+				await sendShell(response);
+				return;
+			}
 			sendHtml(response, 200, landingPage(listSessions(), serverPort(), nonce), nonce);
 			return;
 		}
-
+		if ((method === "GET" || method === "HEAD") && (pathname === "/app.js" || pathname === "/app.css")) {
+			await sendAsset(pathname.slice(1), response);
+			return;
+		}
 		if (pathname === "/favicon.ico") {
 			response.writeHead(204).end();
+			return;
+		}
+
+		const apiTarget = sessionApiTarget(pathname);
+		if (apiTarget) {
+			if (!sessions.has(apiTarget.sessionId)) {
+				sendHtml(response, 404, sessionGonePage(apiTarget.sessionId, nonce), nonce);
+				return;
+			}
+			// The session's own API keeps its `/api/...` paths; only the session prefix is the hub's.
+			await tunnel(
+				{ sessionId: apiTarget.sessionId, rest: `/api${apiTarget.rest}` },
+				request,
+				response,
+				url.search,
+				method,
+			);
 			return;
 		}
 
@@ -551,19 +637,28 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 			response.writeHead(302, { Location: sessionBasePath(target.sessionId) }).end();
 			return;
 		}
-		const record = sessions.get(target.sessionId);
-		if (!record) {
+
+		// The page shell and its assets come from the hub: one bundle for every session, and a UI
+		// change needs only a hub restart.
+		if (target.rest === "/" && (method === "GET" || method === "HEAD")) {
+			if (!sessions.has(target.sessionId)) {
+				sendHtml(response, 404, sessionGonePage(target.sessionId, nonce), nonce);
+				return;
+			}
+			// The page moved to the root with `?session=`; a printed /s/<id>/ link still lands there.
+			response.writeHead(302, { Location: `/?session=${encodeURIComponent(target.sessionId)}` }).end();
+			return;
+		}
+		if (method !== "GET" && method !== "HEAD" && !sessions.has(target.sessionId)) {
 			sendHtml(response, 404, sessionGonePage(target.sessionId, nonce), nonce);
 			return;
 		}
-		proxy(record, target, request, response);
+		await tunnel(target, request, response, url.search, method);
 	}
 
 	/**
-	 * Control plane. Reads are plain GETs so any local tool or browser can inspect the hub, while
-	 * mutations are POSTs. Mutations additionally require a JSON content type: a cross-origin page
-	 * cannot send that without a preflight, and the hub never answers one, so another web page
-	 * cannot register, refresh, or remove sessions through the browser.
+	 * Control plane. Reads are plain GETs so any local tool or browser can inspect the hub; the
+	 * extension reaches the hub over its WebSocket, not through these routes.
 	 */
 	async function handleControl(
 		request: IncomingMessage,
@@ -571,102 +666,308 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 		pathname: string,
 		method: string,
 	): Promise<void> {
-		if (method === "GET" || method === "HEAD") {
-			if (pathname === HELLO_PATH) {
-				sendJson(response, 200, {
-					name: HUB_NAME,
-					protocol: HUB_PROTOCOL,
-					port: serverPort(),
-					sessionCount: sessions.size,
-				});
-				return;
-			}
-			if (pathname === SESSIONS_PATH) {
-				sendJson(response, 200, { sessions: listSessions() });
-				return;
-			}
-			if (pathname === EVENTS_PATH) {
-				streamSessions(request, response);
-				return;
-			}
+		if (pathname !== HELLO_PATH && pathname !== SESSIONS_PATH && pathname !== EVENTS_PATH) {
 			sendJson(response, 404, { error: "Unknown hub endpoint" });
 			return;
 		}
-
-		if (method !== "POST") return sendJson(response, 405, { error: "Method not allowed" });
-		if (!(request.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
-			return sendJson(response, 415, { error: "Expected application/json" });
+		if (method !== "GET" && method !== "HEAD") {
+			sendJson(response, 405, { error: "Method not allowed" });
+			return;
 		}
-		const body = await readJsonBody(request);
-		if (!body) return sendJson(response, 400, { error: "Invalid JSON body" });
-
-		if (pathname === REGISTER_PATH) {
-			const registration = parseRegistration(body);
-			if (!registration) return sendJson(response, 400, { error: "Invalid registration" });
-			if (!sessions.has(registration.sessionId) && sessions.size >= MAX_SESSIONS) {
-				return sendJson(response, 429, { error: "Too many sessions" });
-			}
-			const now = Date.now();
-			const previous = sessions.get(registration.sessionId);
-			const record: SessionRecord = {
-				sessionId: registration.sessionId,
-				port: registration.port,
-				token: registration.token,
-				activity: registration.activity ?? "unknown",
-				registeredAt: previous?.registeredAt ?? now,
-				lastSeen: now,
-				stale: false,
-				url: sessionBasePath(registration.sessionId),
-				...(registration.cwd ? { cwd: registration.cwd } : {}),
-				...(registration.projectName ? { projectName: registration.projectName } : {}),
-				...(registration.name ? { name: registration.name } : {}),
-				...(registration.model ? { model: registration.model } : {}),
-				...(registration.piVersion ? { piVersion: registration.piVersion } : {}),
-				...(registration.extensionVersion ? { extensionVersion: registration.extensionVersion } : {}),
-			};
-			sessions.set(record.sessionId, record);
-			if (!previous) logger.info(`registered session ${record.sessionId.slice(0, 8)} on port ${record.port}`);
-			broadcastSessions();
+		if (pathname === HELLO_PATH) {
 			sendJson(response, 200, {
-				ok: true,
-				basePath: sessionBasePath(record.sessionId),
-				url: sessionBasePath(record.sessionId),
+				name: HUB_NAME,
+				protocol: HUB_PROTOCOL,
+				port: serverPort(),
+				sessionCount: sessions.size,
+				channelPath: CHANNEL_PATH,
 			});
 			return;
 		}
+		if (pathname === SESSIONS_PATH) {
+			sendJson(response, 200, { sessions: listSessions() });
+			return;
+		}
+		streamSessions(request, response);
+	}
 
-		if (pathname === HEARTBEAT_PATH) {
-			const found = requireSession(body);
-			if (!found) return sendJson(response, 404, { ok: false, error: "Unknown session" });
-			const metadata = parseRegistration({ ...body, port: found.record.port, token: found.token });
-			const wasStale = Date.now() - found.record.lastSeen > ttlMs;
-			found.record.lastSeen = Date.now();
-			if (metadata) {
-				found.record.activity = metadata.activity ?? found.record.activity;
-				if (metadata.name !== undefined) found.record.name = metadata.name;
-				if (metadata.model !== undefined) found.record.model = metadata.model;
-				if (metadata.projectName !== undefined) found.record.projectName = metadata.projectName;
-				if (metadata.cwd !== undefined) found.record.cwd = metadata.cwd;
-				if (metadata.piVersion !== undefined) found.record.piVersion = metadata.piVersion;
-				if (metadata.extensionVersion !== undefined) found.record.extensionVersion = metadata.extensionVersion;
+	/** Serve the app shell. The session comes from `?session=`, so one shell serves them all. */
+	async function sendShell(response: ServerResponse): Promise<void> {
+		const template = await readFile(join(webRoot, "index.html"), "utf8");
+		const nonce = randomBytes(16).toString("base64url");
+		const body = template.replaceAll("__PI_CSP_NONCE__", nonce);
+		response.writeHead(200, {
+			"Content-Type": "text/html; charset=utf-8",
+			"Content-Length": Buffer.byteLength(body),
+			"Cache-Control": "no-store",
+			"Content-Security-Policy": `default-src 'none'; style-src 'self' 'nonce-${nonce}'; script-src 'self' 'nonce-${nonce}'; img-src 'self' data: blob:; connect-src 'self'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'`,
+			...PAGE_SECURITY_HEADERS,
+		});
+		response.end(body);
+	}
+
+	async function sendAsset(name: string, response: ServerResponse): Promise<void> {
+		const contentType = ASSET_TYPES[name];
+		if (!contentType) {
+			sendJson(response, 404, { error: "Unknown asset" });
+			return;
+		}
+		let bytes: Buffer;
+		try {
+			bytes = await readFile(join(webRoot, name));
+		} catch {
+			sendJson(response, 404, { error: "Missing asset; run npm run build:web" });
+			return;
+		}
+		response.writeHead(200, {
+			"Content-Type": contentType,
+			"Content-Length": bytes.byteLength,
+			// The bundle is rebuilt on a hub restart; revalidate so a reload always picks it up.
+			"Cache-Control": "no-cache",
+			...PAGE_SECURITY_HEADERS,
+		});
+		response.end(bytes);
+	}
+
+	/** Forward one browser request to the owning session and stream its answer back. */
+	async function tunnel(
+		target: { sessionId: string; rest: string },
+		request: IncomingMessage,
+		response: ServerResponse,
+		search: string,
+		method: string,
+	): Promise<void> {
+		const channel = await requireChannel(target.sessionId);
+		if (!channel) {
+			const freshNonce = randomBytes(16).toString("base64url");
+			const record = sessions.get(target.sessionId);
+			sendHtml(
+				response,
+				502,
+				record
+					? sessionOfflinePage(target.sessionId, record.session.name ?? record.session.projectName, freshNonce)
+					: sessionGonePage(target.sessionId, freshNonce),
+				freshNonce,
+			);
+			return;
+		}
+
+		const headers: Record<string, string> = {};
+		for (const [key, value] of Object.entries(request.headers)) {
+			if (value === undefined) continue;
+			const name = key.toLowerCase();
+			if (HOP_BY_HOP.has(name) || name === "expect") continue;
+			headers[name] = Array.isArray(value) ? value.join(", ") : String(value);
+		}
+		headers["x-pi-webui-via"] = HUB_NAME;
+		// The session trusts the hub's Host and Origin verdict for tunneled requests, so pass along
+		// the origin the browser actually used once this hub has checked it against its own Host.
+		const origin = request.headers.origin;
+		if (typeof origin === "string" && sameOrigin(origin, request.headers.host ?? "")) {
+			headers["x-pi-webui-origin"] = origin;
+		}
+
+		const body = method === "GET" || method === "HEAD" ? undefined : await readRequestBody(request);
+		const id = channel.nextRequestId++;
+		const pending: PendingRequest = {
+			response,
+			status: 200,
+			headers: {},
+		};
+		channel.pending.set(id, pending);
+
+		const release = () => {
+			if (!channel.pending.delete(id)) return;
+			channel.socket.send(JSON.stringify({ t: "cancel", id } satisfies HubToExtensionMessage));
+		};
+		response.on("close", () => {
+			if (!response.writableEnded) release();
+		});
+
+		channel.socket.send(
+			JSON.stringify({
+				t: "request",
+				id,
+				method,
+				path: `${target.rest}${search}`,
+				headers,
+				...(body && body.byteLength > 0 ? { hasBody: true } : {}),
+			} satisfies HubToExtensionMessage),
+		);
+		if (body && body.byteLength > 0) channel.socket.send(body);
+	}
+
+	async function readRequestBody(request: IncomingMessage): Promise<Buffer | undefined> {
+		const chunks: Buffer[] = [];
+		let total = 0;
+		for await (const chunk of request) {
+			const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+			total += buffer.byteLength;
+			if (total > MAX_TUNNEL_BYTES) throw new Error("request body too large");
+			chunks.push(buffer);
+		}
+		return chunks.length > 0 ? Buffer.concat(chunks) : undefined;
+	}
+
+	function acceptChannel(socket: WebSocket): void {
+		let connection: ChannelConnection | undefined;
+		let handshaken = false;
+		/**
+		 * Consumers for the binary frames that follow, in order. A control frame that announces a
+		 * body pushes one; the next binary frame takes it. Several requests can be in flight at once
+		 * (a stream plus a snapshot fetch), so this must be a queue rather than one slot.
+		 */
+		const bodyQueue: Array<(chunk: Buffer) => void> = [];
+
+		socket.on("message", (data: RawData, isBinary: boolean) => {
+			if (isBinary || data instanceof ArrayBuffer || Array.isArray(data)) {
+				bodyQueue.shift()?.(toBuffer(data));
+				return;
 			}
-			// A heartbeat also carries activity and model changes, so the index stays current.
-			if (wasStale || metadata) broadcastSessions();
-			sendJson(response, 200, { ok: true, basePath: sessionBasePath(found.record.sessionId) });
-			return;
-		}
+			let message: ExtensionToHubMessage;
+			try {
+				message = JSON.parse(toBuffer(data).toString("utf8")) as ExtensionToHubMessage;
+			} catch {
+				return;
+			}
+			if (!message || typeof message !== "object") return;
 
-		if (pathname === UNREGISTER_PATH) {
-			const found = requireSession(body);
-			if (!found) return sendJson(response, 200, { ok: true });
-			sessions.delete(found.record.sessionId);
-			logger.info(`unregistered session ${found.record.sessionId.slice(0, 8)}`);
-			broadcastSessions();
-			sendJson(response, 200, { ok: true });
-			return;
-		}
+			if (message.t === "hello") {
+				const info = parseSessionInfo(message.session as unknown as Record<string, unknown>);
+				if (!info) {
+					socket.send(JSON.stringify({ t: "error", message: "Invalid session announcement" } satisfies HubToExtensionMessage));
+					socket.close(1008, "invalid session");
+					return;
+				}
+				if (message.protocol !== HUB_PROTOCOL) {
+					socket.send(
+						JSON.stringify({
+							t: "error",
+							message: `The hub speaks protocol ${HUB_PROTOCOL}; restart the hub or update the extension.`,
+						} satisfies HubToExtensionMessage),
+					);
+					socket.close(1002, "protocol mismatch");
+					return;
+				}
+				const existing = sessions.get(info.sessionId);
+				if (!existing && sessions.size >= MAX_SESSIONS) {
+					socket.send(JSON.stringify({ t: "error", message: "Too many sessions" } satisfies HubToExtensionMessage));
+					socket.close(1013, "too many sessions");
+					return;
+				}
+				// A reconnect replaces the previous channel for the same session.
+				if (existing?.channel && existing.channel.socket !== socket) existing.channel.socket.close(1000, "replaced");
+				handshaken = true;
+				const connection2: ChannelConnection = {
+					sessionId: info.sessionId,
+					socket,
+					connectedAt: Date.now(),
+					lastPingAt: Date.now(),
+					nextRequestId: 0,
+					pending: new Map(),
+				};
+				connection = connection2;
+				const now = Date.now();
+				const record: SessionRecord = existing ?? { session: info, registeredAt: now, lastSeen: now };
+				record.session = info;
+				record.channel = connection2;
+				record.lastSeen = now;
+				delete record.disconnectedAt;
+				sessions.set(info.sessionId, record);
+				const waiting = record.waiting ?? [];
+				record.waiting = [];
+				for (const resume of waiting) resume();
+				logger.info(`session ${info.sessionId.slice(0, 8)} connected`);
+				socket.send(JSON.stringify({ t: "hello-ok", protocol: HUB_PROTOCOL } satisfies HubToExtensionMessage));
+				broadcastSessions();
+				return;
+			}
 
-		sendJson(response, 404, { error: "Unknown hub endpoint" });
+			if (!handshaken || !connection) return;
+			connection.lastPingAt = Date.now();
+			const active = connection;
+			const record = sessions.get(active.sessionId);
+
+			switch (message.t) {
+				case "ping":
+					socket.send(JSON.stringify({ t: "pong", id: message.id } satisfies HubToExtensionMessage));
+					return;
+				case "state": {
+					const info = parseSessionInfo(message.session as unknown as Record<string, unknown>);
+					if (info && record && info.sessionId === record.session.sessionId) {
+						applySessionInfo(record, info);
+						broadcastSessions();
+					}
+					return;
+				}
+				case "response": {
+					const pending = active.pending.get(message.id);
+					if (!pending?.response) return;
+					pending.status = message.status;
+					pending.headers = lowerCaseHeaders(message.headers);
+					if (message.hasBody) {
+						bodyQueue.push((chunk) => {
+							if (pending.response && !pending.response.headersSent) {
+								// One canonical spelling per header: a duplicate Content-Length (or any
+								// header repeated with different case) is a protocol error downstream.
+								const headers = { ...(pending.headers ?? {}) };
+								delete headers["transfer-encoding"];
+								headers["content-length"] = String(chunk.byteLength);
+								pending.response.writeHead(pending.status ?? 200, headers);
+							}
+							pending.response?.end(chunk);
+							pending.onEnd?.();
+							active.pending.delete(message.id);
+						});
+					} else {
+						pending.response.writeHead(pending.status, pending.headers);
+						pending.response.flushHeaders();
+					}
+					return;
+				}
+				case "chunk": {
+					const pending = active.pending.get(message.id);
+					if (!pending?.response) return;
+					bodyQueue.push((chunk) => {
+						pending.response?.write(chunk);
+					});
+					return;
+				}
+				case "end": {
+					const pending = active.pending.get(message.id);
+					if (!pending?.response) return;
+					active.pending.delete(message.id);
+					if (!pending.response.writableEnded) pending.response.end();
+					pending.onEnd?.();
+					return;
+				}
+				case "error":
+					logger.error(`session ${active.sessionId.slice(0, 8)}: ${message.message}`);
+					return;
+				default:
+					return;
+			}
+		});
+
+		socket.on("close", () => {
+			if (!connection) return;
+			const record = sessions.get(connection.sessionId);
+			for (const [, pending] of connection.pending) {
+				if (pending.response && !pending.response.headersSent) {
+					const nonce = randomBytes(16).toString("base64url");
+					sendHtml(pending.response, 502, sessionGonePage(connection.sessionId, nonce), nonce);
+				} else pending.response?.end();
+			}
+			connection.pending.clear();
+			if (record && record.channel === connection) {
+				record.channel = undefined;
+				record.disconnectedAt = Date.now();
+				logger.info(`session ${connection.sessionId.slice(0, 8)} disconnected`);
+				broadcastSessions();
+			}
+		});
+
+		socket.on("error", () => socket.close());
 	}
 
 	/** Server-sent events for the session index: pushes on change, keep-alive comments otherwise. */
@@ -708,77 +1009,6 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 		}
 	}
 
-	function proxy(
-		record: SessionRecord,
-		target: { sessionId: string; rest: string },
-		request: IncomingMessage,
-		response: ServerResponse,
-	): void {
-		const headers: Record<string, string | string[]> = {};
-		for (const [key, value] of Object.entries(request.headers)) {
-			if (value === undefined) continue;
-			const name = key.toLowerCase();
-			if (HOP_BY_HOP.has(name) || name === "host" || name === "expect") continue;
-			headers[name] = value;
-		}
-		const origin = request.headers.origin;
-		if (typeof origin === "string" && sameOrigin(origin, request.headers.host ?? "")) {
-			// The hub already accepted this origin; restate it as the session's own origin so the
-			// session keeps its strict same-origin mutation check without learning about the hub.
-			headers.origin = `http://127.0.0.1:${record.port}`;
-		}
-		headers.host = `127.0.0.1:${record.port}`;
-		headers["x-pi-webui-base"] = sessionBasePath(target.sessionId);
-		headers["x-pi-webui-via"] = HUB_NAME;
-
-		const upstream = proxyRequest(
-			{
-				agent,
-				host: "127.0.0.1",
-				port: record.port,
-				method: request.method,
-				path: `${target.rest}${urlSearchOf(request)}`,
-				headers,
-			},
-			(upstreamResponse) => {
-				const responseHeaders: Record<string, string | string[]> = {};
-				for (const [key, value] of Object.entries(upstreamResponse.headers)) {
-					if (value === undefined) continue;
-					const name = key.toLowerCase();
-					if (HOP_BY_HOP.has(name)) continue;
-					responseHeaders[name] = value;
-				}
-				const location = upstreamResponse.headers.location;
-				if (typeof location === "string" && location.startsWith("/") && !location.startsWith(SESSION_PATH_PREFIX)) {
-					responseHeaders.location = `${SESSION_PATH_PREFIX}${target.sessionId}${location}`;
-				}
-				response.writeHead(upstreamResponse.statusCode ?? 502, responseHeaders);
-				upstreamResponse.pipe(response);
-			},
-		);
-		upstream.on("error", (error: NodeJS.ErrnoException) => {
-			const reason = error.code === "ECONNREFUSED" ? "the session stopped listening" : error.message;
-			logger.error(`proxy to ${record.sessionId.slice(0, 8)} failed: ${reason}`);
-			if (!response.headersSent) {
-				sendHtml(response, 502, sessionGonePage(record.sessionId, randomBytes(16).toString("base64url")), randomBytes(16).toString("base64url"));
-			}
-			else response.destroy();
-		});
-		request.pipe(upstream);
-		// Stop the upstream work only when the browser goes away before the response finished.
-		// Watching the request stream instead would abort every bodyless request immediately.
-		response.on("close", () => {
-			if (!response.writableEnded) upstream.destroy();
-		});
-	}
-
-	function urlSearchOf(request: IncomingMessage): string {
-		const raw = request.url ?? "/";
-		const index = raw.indexOf("?");
-		return index === -1 ? "" : raw.slice(index);
-	}
-
-
 	function serverPort(): number {
 		const address = server.address();
 		return address && typeof address !== "string" ? address.port : 0;
@@ -792,20 +1022,32 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 		});
 	});
 
+	// A session that vanished stays listed briefly, so a hub or session restart does not blank a
+	// browser tab that is already open on it.
 	const sweep = setInterval(() => {
 		const now = Date.now();
 		for (const [id, record] of sessions) {
-			if (now - record.lastSeen > ttlMs + graceMs) {
+			if (!record.channel && record.disconnectedAt && now - record.disconnectedAt > graceMs) {
 				sessions.delete(id);
-				logger.info(`expired session ${id.slice(0, 8)} (no heartbeat)`);
+				logger.info(`forgot session ${id.slice(0, 8)} (gone for ${Math.round((now - record.disconnectedAt) / 1000)}s)`);
 				broadcastSessions();
 			}
 		}
 	}, 2_000);
 	const tick = setInterval(() => broadcastSessions(), options.tickMs ?? SESSION_TICK_MS);
+	const silence = setInterval(() => {
+		const now = Date.now();
+		for (const record of sessions.values()) {
+			if (record.channel && now - record.channel.lastPingAt > silenceMs) {
+				logger.error(`session ${record.session.sessionId.slice(0, 8)} stopped answering; closing its channel`);
+				record.channel.socket.terminate();
+			}
+		}
+	}, 5_000);
 	if (!options.keepAlive) {
 		sweep.unref();
 		tick.unref();
+		silence.unref();
 		server.unref();
 	}
 
@@ -816,10 +1058,19 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 		close: async () => {
 			clearInterval(sweep);
 			clearInterval(tick);
+			clearInterval(silence);
+			// Terminate every channel, including one that has not announced a session yet, and never
+			// wait on a close handshake: a hub restart must not hang, and extensions reconnect anyway.
+			for (const client of channels.clients) client.terminate();
 			sessions.clear();
 			for (const client of eventClients) client.end();
 			eventClients.clear();
-			agent.destroy();
+			const closed = new Promise<void>((resolve) => channels.close(() => resolve()));
+			const guard = new Promise<void>((resolve) => {
+				const timer = setTimeout(resolve, 1_000);
+				timer.unref?.();
+			});
+			await Promise.race([closed, guard]);
 			server.closeAllConnections?.();
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 		},

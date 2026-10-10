@@ -12,28 +12,28 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 export const HUB_NAME = "pi-webui-hub";
-export const HUB_PROTOCOL = 1;
+export const HUB_PROTOCOL = 2;
 /** Port used when the configuration file has no `hub.port`. */
 export const DEFAULT_HUB_PORT = 43118;
-/** How often the extension re-announces a session; the hub expires entries after a few intervals. */
-export const HEARTBEAT_INTERVAL_MS = 3_000;
 /** Path prefix used for every session-scoped request. */
 export const SESSION_PATH_PREFIX = "/s/";
+/** Where the browser asks for one session's data, mirroring `/api/agent/<id>/` in agegr/pi-web. */
+export const SESSION_API_PREFIX = "/api/session/";
+/** Assets owned by the hub and shared by every session page. */
+export const ASSET_PATHS = ["/app.js", "/app.css"] as const;
+/** WebSocket upgrade endpoint an extension dials to join the hub. */
+export const CHANNEL_PATH = "/_hub/channel";
 export const HELLO_PATH = "/_hub/hello";
 export const SESSIONS_PATH = "/_hub/sessions";
 export const EVENTS_PATH = "/_hub/events";
-export const REGISTER_PATH = "/_hub/register";
-export const HEARTBEAT_PATH = "/_hub/heartbeat";
-export const UNREGISTER_PATH = "/_hub/unregister";
 
 /** Host names the hub answers for when the configuration file lists no extra ones. */
 export const DEFAULT_ALLOWED_HOSTS = ["127.0.0.1", "localhost", "[::1]", "::1"] as const;
 
 export type HubActivity = "idle" | "running" | "unknown";
 
-export interface HubRegistration {
+export interface HubSessionInfo {
 	sessionId: string;
-	port: number;
 	activity?: HubActivity;
 	cwd?: string;
 	projectName?: string;
@@ -41,6 +41,51 @@ export interface HubRegistration {
 	model?: string;
 	piVersion?: string;
 	extensionVersion?: string;
+}
+
+/**
+ * Channel messages. A connection carries one session: the extension dials the hub, announces
+ * itself, then serves the browser requests the hub routes to it.
+ *
+ * Every message is a JSON string, except payload bodies (`hasBody`), which are the single binary
+ * message that follows; WebSocket preserves ordering, so the pairing is unambiguous.
+ */
+export type HubToExtensionMessage =
+	| { t: "hello-ok"; protocol: number }
+	| { t: "error"; message: string }
+	| {
+			t: "request";
+			id: number;
+			method: string;
+			path: string;
+			headers: Record<string, string>;
+			hasBody?: boolean;
+	  }
+	| { t: "cancel"; id: number }
+	| { t: "pong"; id: number };
+
+
+export type ExtensionToHubMessage =
+	| { t: "hello"; protocol: number; session: HubSessionInfo }
+	| { t: "state"; session: HubSessionInfo }
+	| { t: "response"; id: number; status: number; headers: Record<string, string>; hasBody?: boolean }
+	| { t: "chunk"; id: number }
+	| { t: "end"; id: number }
+	| { t: "ping"; id: number }
+	| { t: "error"; message: string };
+
+/** How the extension reports its channel to `/webui status`. */
+export type ChannelState = "connected" | "connecting" | "waiting" | "closed";
+
+export interface ChannelStatus {
+	state: ChannelState;
+	/** Loopback URL of the hub the extension dials. */
+	hubUrl: string;
+	channelUrl: string;
+	protocol: number;
+	/** Populated after a failure, cleared on the next successful connection. */
+	error?: string;
+	connectedAt?: number;
 }
 
 export interface HubHello {
@@ -172,8 +217,30 @@ export function hubBaseUrl(options: { agentDir?: string; env?: NodeJS.ProcessEnv
 	return hubUrlForPort(readHubConfig(options).config.port);
 }
 
+
+/** WebSocket URL an extension dials: the hub's one port, upgraded at the channel path. */
+export function channelUrl(hubUrl: string): string {
+	const url = new URL(CHANNEL_PATH, hubUrl);
+	url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+	return url.toString();
+}
 export function sessionBasePath(sessionId: string): string {
 	return `${SESSION_PATH_PREFIX}${sessionId}/`;
+}
+
+/** The data prefix for one session: `/api/session/<id>/`. */
+export function sessionApiPath(sessionId: string): string {
+	return `${SESSION_API_PREFIX}${sessionId}/`;
+}
+
+/** `/api/session/<id>/<rest>`, or undefined when the path is not a session data request. */
+export function sessionApiTarget(pathname: string): { sessionId: string; rest: string } | undefined {
+	if (!pathname.startsWith(SESSION_API_PREFIX)) return undefined;
+	const remainder = pathname.slice(SESSION_API_PREFIX.length);
+	const slash = remainder.indexOf("/");
+	const sessionId = slash === -1 ? remainder : remainder.slice(0, slash);
+	if (!/^[A-Za-z0-9_-]{1,80}$/.test(sessionId)) return undefined;
+	return { sessionId, rest: slash === -1 ? "/" : remainder.slice(slash) };
 }
 
 export function isHubHello(value: unknown): value is HubHello {
@@ -182,6 +249,11 @@ export function isHubHello(value: unknown): value is HubHello {
 	return candidate.name === HUB_NAME && typeof candidate.protocol === "number";
 }
 
+/**
+ * The address a browser opens for one session. The page lives at the hub root and the session is
+ * selected with `?session=`, the same shape agegr/pi-web uses, so a link stays short and the bundle
+ * is shared by every session.
+ */
 export function hubSessionUrl(hubUrl: string, sessionId: string): string {
-	return new URL(sessionBasePath(sessionId), hubUrl).toString();
+	return `${hubUrl.replace(/\/+$/, "")}/?session=${encodeURIComponent(sessionId)}`;
 }

@@ -3,9 +3,14 @@ import http from "node:http";
 import { test } from "vitest";
 import type { PreparedAttachment } from "../src/attachments.js";
 import { ConversationProjection } from "../src/conversation.js";
-import { type WebSendRequest, type WebSendResult, WebUIServer } from "../src/server.js";
+import {
+	type WebSendRequest,
+	type WebSendResult,
+	WebUIServer,
+	type WebUISessionControls,
+} from "../src/server.js";
 
-async function harness() {
+async function harness(controls?: WebUISessionControls) {
 	const conversation = new ConversationProjection({
 		id: "session",
 		cwd: "/workspace/demo",
@@ -14,6 +19,7 @@ async function harness() {
 	const sends: WebSendRequest[] = [];
 	const server = await WebUIServer.start({
 		conversation,
+		...(controls ? { controls } : {}),
 		send: async (request) => {
 			sends.push(request);
 			return { delivery: request.delivery === "steer" ? "steer" : "immediate" };
@@ -63,11 +69,10 @@ test("every session serves its own origin without authentication", async () => {
 	const first = await harness();
 	const second = await harness();
 	try {
-		assert.notEqual(first.server.origin, second.server.origin);
-		assert.equal(first.server.port !== second.server.port, true);
+		// Two sessions can share one process: each service is its own object with no listener of its
+		// own, so only the hub owns a port.
+		assert.notEqual(first.server, second.server);
 		for (const server of [first.server, second.server]) {
-			const direct = await fetch(server.directUrl());
-			assert.equal(direct.status, 200);
 			assert.equal((await api(server, "/api/state")).status, 200);
 		}
 	} finally {
@@ -78,38 +83,20 @@ test("every session serves its own origin without authentication", async () => {
 test("assets and APIs need no credentials and carry restrictive headers plus a base path", async () => {
 	const { server } = await harness();
 	try {
-		const page = await api(server, "/");
-		assert.equal(page.status, 200);
-		assert.equal(page.headers.get("cache-control"), "no-store");
-		assert.equal(page.headers.get("x-content-type-options"), "nosniff");
-		assert.equal(page.headers.get("referrer-policy"), "no-referrer");
-		const contentSecurityPolicy = page.headers.get("content-security-policy") ?? "";
-		assert.match(contentSecurityPolicy, /default-src 'self'/);
-		assert.equal(page.headers.get("access-control-allow-origin"), null);
-		const pageSource = await page.text();
-		assert.match(pageSource, /id="root"/);
-		const nonce = /<meta name="csp-nonce" content="([A-Za-z0-9_-]+)" \/>/.exec(pageSource)?.[1];
-		assert.ok(nonce);
-		assert.match(contentSecurityPolicy, new RegExp(`style-src 'self' 'nonce-${nonce}'`));
-		assert.doesNotMatch(pageSource, /__PI_CSP_NONCE__/);
-		const script = await api(server, "/app.js");
-		assert.equal(script.status, 200);
-		assert.match(script.headers.get("content-type") ?? "", /javascript/);
-		const stylesheet = await api(server, "/app.css");
-		assert.equal(stylesheet.status, 200);
-		assert.match(stylesheet.headers.get("content-type") ?? "", /css/);
-		assert.notEqual((await api(server, "/state.js")).status, 200);
-		const state = (await (await api(server, "/api/state")).json()) as {
-			session: { projectName: string };
-		};
-		assert.equal(state.session.projectName, "demo");
-		// The hub proxies a session under /s/<sessionId>/ and tells the session to serve that base.
-		const prefixed = await api(server, "/", { extraHeaders: { "x-pi-webui-base": "/s/demo-session/" } });
-		assert.match(await prefixed.text(), /<base href="\/s\/demo-session\/" \/>/);
-		// Anything that is not a plain session base path is ignored instead of reflected.
-		for (const base of ["https://attacker.invalid/", "/s/../etc/", "/other/"]) {
-			const rejected = await api(server, "/", { extraHeaders: { "x-pi-webui-base": base } });
-			assert.match(await rejected.text(), /<base href="\/" \/>/);
+		// The hub serves the page shell and its assets; a session answers data only, without
+		// credentials, with restrictive headers and no CORS allowance.
+		const state = await api(server, "/api/state");
+		assert.equal(state.status, 200);
+		assert.equal(state.headers.get("cache-control"), "no-store");
+		assert.equal(state.headers.get("x-content-type-options"), "nosniff");
+		assert.equal(state.headers.get("referrer-policy"), "no-referrer");
+		assert.equal(state.headers.get("access-control-allow-origin"), null);
+		assert.match(state.headers.get("content-security-policy") ?? "", /default-src 'none'/);
+		assert.equal(((await state.json()) as { session: { projectName: string } }).session.projectName, "demo");
+
+		// The page shell lives on the hub now, so a session serves no HTML and no bundle.
+		for (const path of ["/", "/app.js", "/app.css", "/index.html"]) {
+			assert.notEqual((await api(server, path)).status, 200, `${path} must not be served by a session`);
 		}
 	} finally {
 		await server.close();
@@ -1301,3 +1288,81 @@ function rawRequest(server: WebUIServer, path: string, headers: Record<string, s
 		request.end();
 	});
 }
+
+test("the session control routes need the active tab and validate their input", async () => {
+	const calls: string[] = [];
+	const controls: WebUISessionControls = {
+		models: async () => [{ provider: "test", id: "one", name: "One" }],
+		setModel: async (provider, id) => {
+			calls.push(`${provider}/${id}`);
+		},
+		setThinkingLevel: async (level) => {
+			calls.push(level);
+		},
+		compact: async () => {
+			calls.push("compact");
+		},
+	};
+	const { server } = await harness(controls);
+	try {
+		const models = await api(server, "/api/controls/models");
+		assert.equal(models.status, 200);
+		assert.deepEqual(await models.json(), { models: [{ provider: "test", id: "one", name: "One" }] });
+
+		// Every mutation is a same-origin POST from the tab that holds the lease.
+		const withoutLease = await api(server, "/api/controls/model", {
+			method: "POST",
+			body: JSON.stringify({ provider: "test", id: "two" }),
+		});
+		assert.equal(withoutLease.status, 409);
+		await withoutLease.body?.cancel();
+		const hostile = await api(server, "/api/controls/compact", {
+			method: "POST",
+			origin: "http://attacker.invalid",
+			body: "{}",
+		});
+		assert.equal(hostile.status, 403);
+		await hostile.body?.cancel();
+
+		await takeLease(server, "one");
+		for (const [path, body] of [
+			["/api/controls/model", JSON.stringify({ provider: "test", id: "two" })],
+			["/api/controls/thinking", JSON.stringify({ level: "high" })],
+			["/api/controls/compact", "{}"],
+		] as const) {
+			const response = await api(server, path, { method: "POST", client: "one", body });
+			assert.equal(response.status, 200, `${path} should be accepted for the active tab`);
+			await response.body?.cancel();
+		}
+		assert.deepEqual(calls, ["test/two", "high", "compact"]);
+
+		const invalid = await api(server, "/api/controls/model", {
+			method: "POST",
+			client: "one",
+			body: JSON.stringify({ provider: 7 }),
+		});
+		assert.equal(invalid.status, 400);
+		await invalid.body?.cancel();
+	} finally {
+		await server.close();
+	}
+});
+
+test("a session without controls answers 503 instead of pretending", async () => {
+	const { server } = await harness();
+	try {
+		const models = await api(server, "/api/controls/models");
+		assert.equal(models.status, 200);
+		assert.deepEqual(await models.json(), { models: [] });
+		await takeLease(server, "one");
+		const compact = await api(server, "/api/controls/compact", {
+			method: "POST",
+			client: "one",
+			body: "{}",
+		});
+		assert.equal(compact.status, 503);
+		await compact.body?.cancel();
+	} finally {
+		await server.close();
+	}
+});

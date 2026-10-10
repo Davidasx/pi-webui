@@ -2,6 +2,8 @@ export function initialState() {
 	return {
 		sequence: 0,
 		session: undefined,
+		controls: undefined,
+		models: [],
 		messages: [],
 		tools: [],
 		activity: "idle",
@@ -42,6 +44,7 @@ export function applySnapshot(current, snapshot) {
 			...current,
 			sequence: snapshot.sequence,
 			session: snapshot.session,
+			controls: snapshot.controls ?? current.controls,
 			messages: Array.isArray(snapshot.messages) ? snapshot.messages : [],
 			tools: Array.isArray(snapshot.tools) ? snapshot.tools : [],
 			activity: snapshot.activity ?? "idle",
@@ -322,6 +325,7 @@ export function canSend(current) {
 }
 
 export function deliveryNotice(current) {
+	if (current.lastDelivery === "command") return "Command sent to Pi.";
 	if (current.lastDelivery === "immediate") return "Message accepted by Pi.";
 	if (current.lastDelivery === "followUp") return "Queued to run after Pi finishes.";
 	if (current.lastDelivery === "steer") return "Steering message accepted by Pi.";

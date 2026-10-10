@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { test } from "vitest";
-import { HubClient } from "../src/hub-client.js";
 import { type RuntimeDependencies, WebUIRuntime } from "../src/runtime.js";
 import { DEFAULT_SETTINGS, type SettingsLoadResult } from "../src/settings.js";
-import { hubFetchStub, stubServerControl } from "./hub-helpers.js";
+import { stubChannel, stubServerControl, unreachableChannel } from "./hub-helpers.js";
 import {
 	createCustomSelectorHarness,
 	createMockContext,
@@ -12,7 +11,7 @@ import {
 } from "./support.js";
 
 const HUB_TEST_URL = "http://127.0.0.1:43118/";
-const TEST_TOKEN = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const _TEST_TOKEN = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 initTheme("dark", false);
 
@@ -49,15 +48,8 @@ function createRuntime(
 		loadSettings: async () => loaded,
 		saveSettings: async (settings, document) => ({ ...document, ...settings }),
 		initializeSettings: async () => "created",
-		startServer: async () => stubServerControl(),
-		createHubClient: (options) =>
-			new HubClient({
-				...options,
-				hubUrl: HUB_TEST_URL,
-				fetchImpl: hubFetchStub(),
-				token: TEST_TOKEN,
-				heartbeatIntervalMs: 60_000,
-			}),
+		createService: () => stubServerControl(),
+		createChannel: (options) => stubChannel({ ...options, hubUrl: HUB_TEST_URL }),
 		readPiSettings: async () => ({ autoResize: true, blockImages: false, warnings: [] }),
 		processImages: async () => [],
 		...overrides,
@@ -69,7 +61,7 @@ function createRuntime(
 test("bare webui opens a cancellable TUI menu while open publishes the hub link", async () => {
 	let starts = 0;
 	const { mock, runtime } = createRuntime({
-		startServer: async () => {
+		createService: () => {
 			starts += 1;
 			return stubServerControl();
 		},
@@ -93,7 +85,7 @@ test("bare webui opens a cancellable TUI menu while open publishes the hub link"
 
 	await command.handler("open", tui.ctx);
 	assert.equal(starts, 1);
-	assert.match(tui.notifications.at(-1)?.message ?? "", /http:\/\/127\.0\.0\.1:43118\/s\/[A-Za-z0-9_-]+\//);
+	assert.match(tui.notifications.at(-1)?.message ?? "", /http:\/\/127\.0\.0\.1:43118\/\?session=[A-Za-z0-9_-]+/);
 });
 
 test("webui command completes and routes settings, status, help, and invalid arguments", async () => {
@@ -119,7 +111,7 @@ test("webui command completes and routes settings, status, help, and invalid arg
 		/Image limits \(defaults\): 8 images, 10 MiB\/image, 40 MiB\/batch, 50,000,000 pixels\/image/,
 	);
 	assert.match(status, /server: stopped/i);
-	assert.match(status, /hub: disabled at http:\/\/127\.0\.0\.1:43118\//i);
+	assert.match(status, /hub: not started \(http:\/\/127\.0\.0\.1:43118\/\)/i);
 	await command.handler("help", context.ctx);
 	const help = context.notifications.at(-1)?.message ?? "";
 	assert.match(help, /\/webui \[open\|hub\|settings\|status\|help\|init\]/i);
@@ -133,9 +125,10 @@ test("webui command completes and routes settings, status, help, and invalid arg
 	await command.handler("open", context.ctx);
 	await command.handler("status", context.ctx);
 	const runningStatus = context.notifications.at(-1)?.message ?? "";
-	assert.match(runningStatus, /server: running on http:\/\/127\.0\.0\.1:1234/i);
-	assert.match(runningStatus, /hub: registered at http:\/\/127\.0\.0\.1:43118\//i);
-	assert.match(runningStatus, /link: http:\/\/127\.0\.0\.1:43118\/s\//i);
+	assert.match(runningStatus, /server: running on http:\/\/127\.0\.0\.1:43118/i);
+	assert.match(runningStatus, /link: http:\/\/127\.0\.0\.1:43118\/\?session=test-session$/im);
+	assert.match(runningStatus, /hub: connected to http:\/\/127\.0\.0\.1:43118\//i);
+	assert.match(runningStatus, /link: http:\/\/127\.0\.0\.1:43118\/\?session=/i);
 });
 
 test("a menu selection cannot dispatch into a replacement session", async () => {
@@ -143,7 +136,7 @@ test("a menu selection cannot dispatch into a replacement session", async () => 
 	let options: string[] = [];
 	let starts = 0;
 	const { mock, runtime } = createRuntime({
-		startServer: async () => {
+		createService: () => {
 			starts += 1;
 			return {
 				...stubServerControl(),
@@ -221,7 +214,7 @@ test("menu secondary screens return with stable selection and no server side eff
 	let starts = 0;
 	let customCalls = 0;
 	const { mock, runtime } = createRuntime({
-		startServer: async () => {
+		createService: () => {
 			starts += 1;
 			return {
 				...stubServerControl(),
@@ -257,7 +250,7 @@ test("menu secondary screens return with stable selection and no server side eff
 test("bare webui is side-effect free without UI and RPC cancellation stays observable", async () => {
 	let starts = 0;
 	const { mock, runtime } = createRuntime({
-		startServer: async () => {
+		createService: () => {
 			starts += 1;
 			return {
 				...stubServerControl(),
@@ -325,7 +318,7 @@ test("invalid settings expose read-only repair guidance instead of a failing tog
 
 test("open exposes distinct applying state before publishing success", async () => {
 	const starting = deferred<Awaited<ReturnType<typeof stubServerControl>>>();
-	const { mock, runtime } = createRuntime({ startServer: async () => starting.promise });
+	const { mock, runtime } = createRuntime({ createService: () => starting.promise });
 	const context = createMockContext({ hasUI: true, mode: "rpc" });
 	await runtime.start(context.ctx);
 	const opening = mock.commands.get("webui")?.handler("open", context.ctx);
@@ -333,7 +326,7 @@ test("open exposes distinct applying state before publishing success", async () 
 	starting.resolve(stubServerControl());
 	await opening;
 	assert.equal(context.statuses.get("webui:activity"), undefined);
-	assert.match(context.notifications.at(-1)?.message ?? "", /127\.0\.0\.1:43118\/s\//);
+	assert.match(context.notifications.at(-1)?.message ?? "", /127\.0\.0\.1:43118\/\?session=/);
 
 	const refreshing = mock.commands.get("webui")?.handler("open", context.ctx);
 	assert.equal(context.statuses.get("webui:activity"), "Creating fresh WebUI link…");
@@ -342,41 +335,23 @@ test("open exposes distinct applying state before publishing success", async () 
 });
 
 test("open failures preserve valid server state and clear actionable activity feedback", async () => {
-	let issues = 0;
 	const { mock, runtime } = createRuntime({
-		startServer: async () =>
-			stubServerControl({
-				directUrl: () => {
-					issues += 1;
-					if (issues === 2) throw new Error("link source unavailable");
-					return "http://127.0.0.1:1234/";
-				},
-			}),
-		// No hub: /webui open must fall back to the session-local link.
-		createHubClient: (options) =>
-				new HubClient({
-				...options,
-				hubUrl: HUB_TEST_URL,
-				fetchImpl: hubFetchStub({ reachable: false }),
-				token: TEST_TOKEN,
-				heartbeatIntervalMs: 60_000,
-			}),
+		createChannel: (options) => unreachableChannel({ ...options, hubUrl: HUB_TEST_URL }),
 	});
 	const context = createMockContext({ hasUI: true, mode: "rpc" });
 	await runtime.start(context.ctx);
 	const command = mock.commands.get("webui");
 	await command?.handler("open", context.ctx);
-	await command?.handler("open", context.ctx);
-	assert.match(
-		context.notifications.at(-1)?.message ?? "",
-		/link source unavailable.*Retry with \/webui open/i,
-	);
+	// The hub is unreachable here, so the session reports the wait instead of inventing a link, and
+	// keeps trying on its own.
+	assert.match(context.notifications.at(-1)?.message ?? "", /did not answer.*connects as soon as the hub runs/is);
+	assert.match(String(context.widgets.get("webui")), /waiting for the hub/);
 	assert.equal(context.statuses.get("webui:activity"), undefined);
 	await command?.handler("status", context.ctx);
 	assert.match(context.notifications.at(-1)?.message ?? "", /Server: Running/);
 
 	const failed = createRuntime({
-		startServer: async () => {
+		createService: () => {
 			throw new Error("listener unavailable");
 		},
 	});

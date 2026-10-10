@@ -46,6 +46,12 @@ const SUPPORTED_IMAGE_TYPES = new Set([
 ]);
 
 const clientId = crypto.randomUUID();
+const sessionId = new URLSearchParams(window.location.search).get("session") ?? "";
+/** Everything this page fetches belongs to one session. */
+const apiBase = sessionId ? `api/session/${encodeURIComponent(sessionId)}/` : "api/";
+function api(path) {
+	return `${apiBase}${path}`;
+}
 const listeners = new Set();
 const retryFiles = new Map();
 const uploadProgress = new Map();
@@ -170,7 +176,48 @@ export const webClient = {
 		model = followLatest(model);
 		emit({ scrollToLatest: true });
 	},
+	availableModels() {
+		return model.models;
+	},
+	commands() {
+		return model.controls?.commands ?? [];
+	},
+	async loadModels() {
+		try {
+			const response = await fetch(api("controls/models"), { cache: "no-store" });
+			if (!response.ok) throw new Error(await responseError(response));
+			const payload = await response.json();
+			model = { ...model, models: Array.isArray(payload.models) ? payload.models : [] };
+			emit();
+		} catch (error) {
+			setError(errorMessage(error));
+		}
+	},
+	async setModel(provider, id) {
+		await controlRequest(api("controls/model"), { provider, id });
+	},
+	async setThinkingLevel(level) {
+		await controlRequest(api("controls/thinking"), { level });
+	},
+	async compactSession() {
+		await controlRequest(api("controls/compact"), {});
+	},
 };
+
+/** A control mutation: the active tab only, like every other session write. */
+async function controlRequest(path, body) {
+	try {
+		const response = await fetch(path, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", "X-Pi-Web-Client": clientId },
+			body: JSON.stringify(body),
+		});
+		if (!response.ok) throw new Error(await responseError(response));
+		await refreshSnapshot();
+	} catch (error) {
+		setError(errorMessage(error));
+	}
+}
 
 async function initialize() {
 	try {
@@ -195,7 +242,7 @@ async function refreshSnapshot(requiredSequence = 0) {
 		snapshotRefresh = (async () => {
 			do {
 				let pendingConversation = {};
-				const response = await fetch("api/state", { cache: "no-store" });
+				const response = await fetch(api("state"), { cache: "no-store" });
 				if (!response.ok) throw new Error(await responseError(response));
 				const snapshot = await response.json();
 				const replacesConversation =
@@ -217,7 +264,7 @@ async function refreshSnapshot(requiredSequence = 0) {
 }
 
 async function claimLease() {
-	const response = await fetch("api/lease", {
+	const response = await fetch(api("lease"), {
 		method: "POST",
 		headers: { "Content-Type": "application/json", "X-Pi-Web-Client": clientId },
 		body: JSON.stringify({ clientId }),
@@ -231,7 +278,7 @@ async function claimLease() {
 function connectEvents() {
 	clearTimeout(reconnectTimer);
 	events?.close();
-	events = new EventSource(`api/events?since=${model.sequence}`);
+	events = new EventSource(api(`events?since=${model.sequence}`));
 	events.addEventListener("open", () => {
 		lastEventAt = Date.now();
 		reconnectDelay = 500;
@@ -362,7 +409,7 @@ async function send(steer) {
 	model = prepared.state;
 	emit();
 	try {
-		const response = await fetch("api/messages", {
+		const response = await fetch(api("messages"), {
 			method: "POST",
 			headers: { "Content-Type": "application/json", "X-Pi-Web-Client": clientId },
 			body: JSON.stringify({
@@ -414,7 +461,7 @@ async function addFiles(fileList) {
 	try {
 		mutatingAttachments = true;
 		emit();
-		const response = await attachmentMutation("api/attachments/reserve", {
+		const response = await attachmentMutation(api("attachments/reserve"), {
 			method: "POST",
 			body: JSON.stringify({
 				revision: model.attachmentRevision,
@@ -443,7 +490,7 @@ async function uploadFile(id, file) {
 	emit();
 	try {
 		const state = await uploadAttachment(
-			`api/attachments/${encodeURIComponent(id)}/upload?revision=${model.attachmentRevision}`,
+			api(`attachments/${encodeURIComponent(id)}/upload?revision=${model.attachmentRevision}`),
 			file,
 			(progress) => {
 				uploadProgress.set(id, progress);
@@ -488,7 +535,7 @@ async function retryImage(id) {
 		if (file) await uploadFile(id, file);
 		else {
 			const response = await attachmentMutation(
-				`api/attachments/${encodeURIComponent(id)}/retry`,
+				api(`attachments/${encodeURIComponent(id)}/retry`),
 				{
 					method: "POST",
 					body: JSON.stringify({ revision: model.attachmentRevision }),
@@ -525,7 +572,7 @@ function flushDraftText() {
 					throw new Error("Reconnect the active tab to save this draft.");
 				}
 				const submittedText = model.text;
-				const response = await fetch("api/draft", {
+				const response = await fetch(api("draft"), {
 					method: "POST",
 					headers: { "Content-Type": "application/json", "X-Pi-Web-Client": clientId },
 					body: JSON.stringify({
@@ -554,7 +601,7 @@ async function reattachSentImage(retainedImageId) {
 	mutatingAttachments = true;
 	emit();
 	try {
-		const response = await attachmentMutation("api/sent-images/reattach", {
+		const response = await attachmentMutation(api("sent-images/reattach"), {
 			method: "POST",
 			body: JSON.stringify({
 				revision: model.attachmentRevision,
@@ -578,7 +625,7 @@ async function forgetSentImage(retainedImageId) {
 	if (composerLocked() || !retainedImageId) return;
 	try {
 		const response = await attachmentMutation(
-			`api/sent-images/${encodeURIComponent(retainedImageId)}?revision=${model.sentImages.revision}`,
+			api(`sent-images/${encodeURIComponent(retainedImageId)}?revision=${model.sentImages.revision}`),
 			{ method: "DELETE" },
 		);
 		model = applySentImages(model, response);
@@ -591,7 +638,7 @@ async function forgetSentImage(retainedImageId) {
 async function clearAttachments() {
 	if (composerLocked() || model.images.length < 2) return;
 	const clearedIds = model.images.map((image) => image.id);
-	const state = await mutateAttachmentState("api/attachments/clear", {
+	const state = await mutateAttachmentState(api("attachments/clear"), {
 		method: "POST",
 		body: JSON.stringify({ revision: model.attachmentRevision }),
 	});
@@ -612,7 +659,7 @@ async function reorderImages(images, focusId) {
 	mutatingAttachments = true;
 	emit({ focusTarget: focusId });
 	try {
-		const state = await attachmentMutation("api/attachments/reorder", {
+		const state = await attachmentMutation(api("attachments/reorder"), {
 			method: "POST",
 			body: JSON.stringify({ revision: previousRevision, ids: images.map((image) => image.id) }),
 		});
@@ -630,7 +677,7 @@ async function reorderImages(images, focusId) {
 async function removeImage(id) {
 	if (composerLocked()) return;
 	const state = await mutateAttachmentState(
-		`api/attachments/${encodeURIComponent(id)}?revision=${model.attachmentRevision}`,
+		api(`attachments/${encodeURIComponent(id)}?revision=${model.attachmentRevision}`),
 		{ method: "DELETE", headers: { "Content-Type": "application/json" } },
 	);
 	if (state) {

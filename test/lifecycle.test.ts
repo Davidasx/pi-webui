@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { HubClient } from "../src/hub-client.js";
 import { type RuntimeDependencies, WebUIRuntime } from "../src/runtime.js";
 import type { WebSendRequest, WebUIServerOptions } from "../src/server.js";
 import { DEFAULT_SETTINGS } from "../src/settings.js";
-import { hubFetchStub, stubServerControl } from "./hub-helpers.js";
+import { stubChannel, stubServerControl, } from "./hub-helpers.js";
 
 function nextTask(): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, 0));
@@ -50,19 +49,40 @@ function harness(overrides: Partial<RuntimeDependencies> = {}) {
 		},
 	];
 	let serverOptions: WebUIServerOptions | undefined;
+	let compactions = 0;
 	let starts = 0;
 	let closes = 0;
 	const server = {
 		origin: "http://127.0.0.1:1234",
-		port: 1234,
-		directUrl() {
-			return "http://127.0.0.1:1234/";
-		},
+		serve: async () => undefined,
 		async close() {
 			closes += 1;
 		},
 	};
+	let thinkingLevel = "medium";
+	let sessionName: string | undefined = "Demo session";
+	let contextUsage: { tokens: number | null; percent: number | null; contextWindow: number } | undefined = {
+		tokens: 1_000,
+		percent: 4,
+		contextWindow: 272_000,
+	};
+	let registeredCommands: Array<{ name: string; description?: string; source: string }> = [];
 	const pi = {
+		getCommands: () => registeredCommands,
+		getActiveTools: () => ["read", "bash"],
+		getAllTools: () => ["read", "bash", "edit", "write"],
+		getThinkingLevel: () => thinkingLevel,
+		setThinkingLevel(level: string) {
+			thinkingLevel = level;
+		},
+		async setModel(next: { provider: string; id: string }) {
+			model = { provider: next.provider, id: next.id, input: ["text", "image"] };
+			for (const handler of events.get("model_select") ?? []) await handler({} as never, ctx as never);
+			return true;
+		},
+		setSessionName(name: string) {
+			sessionName = name;
+		},
 		registerCommand(name: string, command: never) {
 			commands.set(name, command);
 		},
@@ -106,7 +126,16 @@ function harness(overrides: Partial<RuntimeDependencies> = {}) {
 		get model() {
 			return model;
 		},
+		getContextUsage: () => contextUsage,
+		scopedModels: [],
+		compact() {
+			compactions += 1;
+		},
 		modelRegistry: {
+			find: (provider: string, id: string) => ({ provider, id, input: ["text", "image"], name: `${id} display` }),
+			getAvailable: () => [
+				{ provider: "test", id: "test-model", input: ["text", "image"], name: "Test Model" },
+			],
 			hasConfiguredAuth() {
 				return auth.ok;
 			},
@@ -136,15 +165,8 @@ function harness(overrides: Partial<RuntimeDependencies> = {}) {
 			},
 		},
 	};
-	const dependencies: Omit<RuntimeDependencies, "createHubClient"> & Partial<RuntimeDependencies> = {
-		createHubClient: (options) =>
-			new HubClient({
-				...options,
-				hubUrl: "http://127.0.0.1:43118/",
-				fetchImpl: hubFetchStub(),
-				token: "cccccccccccccccccccccccccccccccccccccccc",
-				heartbeatIntervalMs: 60_000,
-			}),
+	const dependencies: Omit<RuntimeDependencies, "createChannel"> & Partial<RuntimeDependencies> = {
+		createChannel: (options) => stubChannel({ ...options, hubUrl: "http://127.0.0.1:43118/" }),
 		loadSettings: async () => ({
 			kind: "missing",
 			path: "/agent/pi-webui.json",
@@ -154,7 +176,7 @@ function harness(overrides: Partial<RuntimeDependencies> = {}) {
 		}),
 		saveSettings: async (settings, document) => ({ ...document, ...settings }),
 		initializeSettings: async () => "created",
-		startServer: async (options) => {
+		createService: (options) => {
 			starts += 1;
 			serverOptions = options;
 			return server;
@@ -210,6 +232,18 @@ function harness(overrides: Partial<RuntimeDependencies> = {}) {
 		},
 		setAuth(value: { ok: boolean; error?: string; apiKey?: string }) {
 			auth = value;
+		},
+		setCommands(next: Array<{ name: string; description?: string; source: string }>) {
+			registeredCommands = next;
+		},
+		get compactions() {
+			return compactions;
+		},
+		get sessionName() {
+			return sessionName;
+		},
+		setContextUsage(next: typeof contextUsage) {
+			contextUsage = next;
 		},
 		setIdle(value: boolean) {
 			idle = value;
@@ -289,7 +323,7 @@ test("invalid settings warn and automatic startup failures remain non-fatal", as
 			source: "settings file",
 			document: { startOnSessionStart: true },
 		}),
-		startServer: async () => {
+		createService: () => {
 			throw new Error("listener unavailable");
 		},
 	});
@@ -825,7 +859,7 @@ test("a slow stale shutdown cannot clear a replacement session", async () => {
 	const firstClose = deferred<void>();
 	let serverStarts = 0;
 	const h = harness({
-		startServer: async () => {
+		createService: () => {
 			serverStarts += 1;
 			const current = serverStarts;
 			return {
@@ -842,17 +876,17 @@ test("a slow stale shutdown cannot clear a replacement session", async () => {
 	await Promise.resolve();
 	await h.emit("session_start", { reason: "reload" });
 	await h.commands.get("webui")?.handler("", h.ctx as never);
-	assert.match(String(h.widgets.get("webui")), /127\.0\.0\.1:43118\/s\//);
+	assert.match(String(h.widgets.get("webui")), /127\.0\.0\.1:43118\/\?session=/);
 	firstClose.resolve(undefined);
 	await shuttingDown;
-	assert.match(String(h.widgets.get("webui")), /127\.0\.0\.1:43118\/s\//);
+	assert.match(String(h.widgets.get("webui")), /127\.0\.0\.1:43118\/\?session=/);
 	await h.commands.get("webui")?.handler("", h.ctx as never);
 	assert.doesNotMatch(h.notifications.at(-1) ?? "", /could not start/i);
 });
 
 test("replacement and shutdown close stale servers and invalidate send callbacks", async () => {
 	const gate = deferred<ReturnType<typeof harness>["server"]>();
-	const h = harness({ startServer: async () => gate.promise });
+	const h = harness({ createService: () => gate.promise });
 	await h.emit("session_start");
 	const opening = h.commands.get("webui")?.handler("open", h.ctx as never);
 	const replacing = h.emit("session_start", { reason: "reload" });
@@ -865,3 +899,70 @@ test("replacement and shutdown close stale servers and invalidate send callbacks
 });
 
 void ({} as WebSendRequest);
+
+test("slash commands run in Pi and never reach the model as prose", async () => {
+	const h = harness();
+	h.setCommands([{ name: "webui", description: "Pi WebUI", source: "extension" }]);
+	await h.emit("session_start");
+	await h.commands.get("webui")?.handler("", h.ctx as never);
+	const send = h.serverOptions?.send;
+	assert.ok(send);
+
+	// A registered command is dispatched by Pi itself: no browser envelope, no model turn.
+	assert.deepEqual(await send({ requestId: "cmd-1", text: "/webui status", images: [], delivery: "next" }), {
+		delivery: "command",
+	});
+	const dispatched = h.sent.at(-1);
+	assert.equal(dispatched?.content, "/webui status");
+	assert.deepEqual(dispatched?.options, { expandPromptTemplates: true, deliverAs: "steer" });
+
+	// Built-ins the page implements run through the session controls instead of the prompt path.
+	await send({ requestId: "cmd-2", text: "/compact", images: [], delivery: "next" });
+	assert.equal(h.compactions, 1);
+	await send({ requestId: "cmd-3", text: "/name Renamed here", images: [], delivery: "next" });
+	assert.equal(h.sessionName, "Renamed here");
+	await send({ requestId: "cmd-4", text: "/thinking high", images: [], delivery: "next" });
+	assert.equal(h.sent.length, 1, "only the registered command reaches Pi's prompt path");
+
+	// Terminal-only built-ins answer with a hint, and anything that is not a command stays prose.
+	await assert.rejects(
+		() => send({ requestId: "cmd-5", text: "/tree", images: [], delivery: "next" }),
+		/runs in the terminal/,
+	);
+	await send({ requestId: "cmd-6", text: "/etc/hosts is wrong", images: [], delivery: "next" });
+	assertBrowserEnvelope(h.sent.at(-1)?.content);
+});
+
+test("the session snapshot carries the controls the top bar renders", async () => {
+	const h = harness();
+	h.setCommands([{ name: "deploy", description: "Ship it", source: "prompt" }]);
+	await h.emit("session_start");
+	await h.commands.get("webui")?.handler("", h.ctx as never);
+	const controls = h.serverOptions?.conversation.snapshot().controls;
+	assert.deepEqual(controls?.model, { provider: "test", id: "test-model" });
+	assert.equal(controls?.thinkingLevel, "medium");
+	assert.deepEqual(controls?.context, { tokens: 1_000, percent: 4, contextWindow: 272_000 });
+	assert.deepEqual(controls?.tools, { active: 2, total: 4 });
+	assert.ok(controls?.commands.some((command) => command.name === "deploy" && command.source === "prompt"));
+	assert.ok(controls?.commands.some((command) => command.name === "compact" && command.supported));
+	assert.equal(controls?.commands.find((command) => command.name === "tree")?.supported, false);
+});
+
+test("the control endpoints switch model, thinking level, and compaction", async () => {
+	const h = harness();
+	await h.emit("session_start");
+	await h.commands.get("webui")?.handler("", h.ctx as never);
+	const controls = h.serverOptions?.controls;
+	assert.ok(controls);
+	assert.deepEqual(await controls.models(), [{ provider: "test", id: "test-model", name: "Test Model" }]);
+	await controls.setModel("test", "other-model");
+	assert.deepEqual(h.serverOptions?.conversation.snapshot().controls?.model, {
+		provider: "test",
+		id: "other-model",
+	});
+	await controls.setThinkingLevel("high");
+	assert.equal(h.serverOptions?.conversation.snapshot().controls?.thinkingLevel, "high");
+	await controls.compact();
+	assert.equal(h.compactions, 1);
+	await assert.rejects(() => controls.setThinkingLevel("enormous"), /Unknown thinking level/);
+});

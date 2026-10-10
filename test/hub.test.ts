@@ -1,73 +1,84 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "vitest";
 import { ConversationProjection } from "../src/conversation.js";
 import { type Hub, startHub } from "../src/hub.js";
-import { HubClient } from "../src/hub-client.js";
+import { HubChannel } from "../src/hub-channel.js";
 import {
 	configFilePath,
 	DEFAULT_ALLOWED_HOSTS,
 	DEFAULT_HUB_PORT,
 	readHubConfig,
 	SESSION_PATH_PREFIX,
+	sessionApiPath,
 	sessionBasePath,
 } from "../src/hub-protocol.js";
 import { type WebSendRequest, WebUIServer } from "../src/server.js";
 
-interface Sidecar {
-	sessionId: string;
-	server: WebUIServer;
-	client: HubClient;
-	sends: WebSendRequest[];
-	connect(): Promise<void>;
-	stop(): Promise<void>;
-}
-
-async function createSidecar(hubUrl: string, sessionId: string, projectName = "demo"): Promise<Sidecar> {
-	const conversation = new ConversationProjection({ id: sessionId, cwd: `/workspace/${projectName}`, projectName });
-	const sends: WebSendRequest[] = [];
-	const server = await WebUIServer.start({
-		conversation,
-		send: async (request) => {
-			sends.push(request);
-			return { delivery: request.delivery === "steer" ? "steer" : "immediate" };
-		},
+/**
+ * A session stands in for a real Pi process: the same web service the extension builds, driven by
+ * the same channel client, dialing a real hub over a real WebSocket.
+ */
+async function createSession(hub: Hub, hubUrl: string, sessionId: string, projectName = "demo") {
+	const conversation = new ConversationProjection({
+		id: sessionId,
+		cwd: `/workspace/${projectName}`,
+		projectName,
 	});
-	const client = new HubClient({
+	const sends: WebSendRequest[] = [];
+	const service = typeService(
+		WebUIServer.create(
+			{
+				conversation,
+				send: async (request) => {
+					sends.push(request);
+					return { delivery: request.delivery === "steer" ? "steer" : "immediate" };
+				},
+			},
+			hubUrl.replace(/\/+$/, ""),
+		),
+	);
+	const channel = new HubChannel({
 		hubUrl,
-		metadata: () => ({
+		minRetryMs: 20,
+		maxRetryMs: 60,
+		session: () => ({
 			sessionId,
-			port: server.port,
 			projectName,
 			cwd: `/workspace/${projectName}`,
 			activity: "idle",
 			model: "demo/model",
 		}),
-		token: "b".repeat(40),
-		heartbeatIntervalMs: 40,
-		timeoutMs: 1_500,
+		serve: (request, response) => service.serve(request, response),
 	});
+	channel.start();
+	await waitFor(() => channel.statusSnapshot().state === "connected", `session ${sessionId} connects`);
+	// The client is "connected" as soon as the socket opens; the hub knows the session once it has
+	// processed the announcement that follows.
+	await waitFor(
+		() => hub.sessions().some((entry) => entry.sessionId === sessionId),
+		`the hub registers ${sessionId}`,
+	);
 	return {
 		sessionId,
-		server,
-		client,
+		service,
+		channel,
 		sends,
-		async connect() {
-			await client.start();
-			assert.equal(client.statusSnapshot().state, "registered", `sidecar ${sessionId} failed to register`);
-			assert.equal(client.statusSnapshot().hubUrl, hubUrl);
-		},
 		async stop() {
-			await client.stop();
-			await server.close();
+			channel.stop();
+			await service.close();
 		},
 	};
 }
 
-async function readSseUntil(response: Response, marker: string): Promise<string> {
+function typeService(service: WebUIServer) {
+	return service;
+}
+
+async function _readSseUntil(response: Response, marker: string): Promise<string> {
 	const reader = response.body?.getReader();
 	assert.ok(reader, "expected a streaming response body");
 	const decoder = new TextDecoder();
@@ -82,14 +93,16 @@ async function readSseUntil(response: Response, marker: string): Promise<string>
 	return text;
 }
 
-
 /** Raw Host-header probe: node:http lets a test control the Host that fetch would override. */
-function requestStatus(port: number, host: string): Promise<number> {
+function requestStatus(port: number, host: string, path = "/"): Promise<number> {
 	return new Promise((resolve, reject) => {
-		const request = http.request({ host: "127.0.0.1", port, path: "/", method: "GET", headers: { host } }, (response) => {
-			response.resume();
-			response.once("end", () => resolve(response.statusCode ?? 0));
-		});
+		const request = http.request(
+			{ host: "127.0.0.1", port, path, method: "GET", headers: { host } },
+			(response) => {
+				response.resume();
+				response.once("end", () => resolve(response.statusCode ?? 0));
+			},
+		);
 		request.once("error", reject);
 		request.end();
 	});
@@ -109,22 +122,19 @@ function freePort(): Promise<number> {
 }
 
 async function waitFor(predicate: () => Promise<boolean> | boolean, message: string): Promise<void> {
-	for (let attempt = 0; attempt < 200; attempt += 1) {
+	for (let attempt = 0; attempt < 300; attempt += 1) {
 		if (await predicate()) return;
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 	throw new Error(`condition was not met: ${message}`);
 }
 
-test("hub lists sessions and proxies each one under its own path prefix", async () => {
+test("hub lists sessions, serves the page, and tunnels each session's API", async () => {
 	const hub = await startHub({ port: 0 });
 	const hubUrl = `http://127.0.0.1:${hub.port}/`;
-	const first = await createSidecar(hubUrl, "session-alpha", "alpha");
-	const second = await createSidecar(hubUrl, "session-beta", "beta");
+	const first = await createSession(hub, hubUrl, "session-alpha", "alpha");
+	const second = await createSession(hub, hubUrl, "session-beta", "beta");
 	try {
-		await first.connect();
-		await second.connect();
-
 		const index = await fetch(hubUrl);
 		const indexHtml = await index.text();
 		assert.equal(index.status, 200);
@@ -132,23 +142,32 @@ test("hub lists sessions and proxies each one under its own path prefix", async 
 		assert.match(indexHtml, /session-beta/);
 		assert.match(indexHtml, new RegExp(`${SESSION_PATH_PREFIX}session-alpha/`));
 
-		// The session page keeps its own nonce but is served under the hub's base path so that the
-		// browser resolves relative asset and API URLs back through this prefix.
-		const page = await fetch(`${hubUrl}${sessionBasePath("session-alpha").slice(1)}`);
+		// The hub serves the page shell at the root, selected with ?session=, so a UI change needs
+		// only a hub restart.
+		const page = await fetch(`${hubUrl}?session=session-alpha`);
 		const pageHtml = await page.text();
 		assert.equal(page.status, 200);
-		assert.match(pageHtml, /<base href="\/s\/session-alpha\/" \/>/);
 		assert.doesNotMatch(pageHtml, /__PI_CSP_NONCE__/);
-		assert.doesNotMatch(pageHtml, /__PI_BASE_HREF__/);
+		assert.match(pageHtml, /src="\/app.js"/);
+		assert.match(page.headers.get("content-security-policy") ?? "", /script-src 'self'/);
 
-		const script = await fetch(new URL(`${sessionBasePath("session-alpha")}app.js`, hubUrl));
+		// The bundle is one file for every session, served from the hub root.
+		const script = await fetch(`${hubUrl}app.js`);
 		assert.equal(script.status, 200);
 		assert.match(script.headers.get("content-type") ?? "", /javascript/);
 		await script.body?.cancel();
 
-		// Mutations arrive with the browser's hub origin; the hub restates it as the session origin
-		// so the session keeps its strict same-origin check.
-		const lease = await fetch(new URL(`${sessionBasePath("session-alpha")}api/lease`, hubUrl), {
+		// A printed /s/<id>/ link still works and forwards to the query-parameter page.
+		const legacy = await fetch(`${hubUrl}${sessionBasePath("session-alpha").slice(1)}`, { redirect: "manual" });
+		assert.equal(legacy.status, 302);
+		assert.equal(legacy.headers.get("location"), "/?session=session-alpha");
+		await legacy.body?.cancel();
+
+		const state = await fetch(new URL(`${sessionApiPath("session-alpha")}state`, hubUrl));
+		assert.equal(state.status, 200);
+		assert.equal(((await state.json()) as { session: { projectName: string } }).session.projectName, "alpha");
+
+		const lease = await fetch(new URL(`${sessionApiPath("session-alpha")}lease`, hubUrl), {
 			method: "POST",
 			headers: { "content-type": "application/json", origin: hubUrl.slice(0, -1), "x-pi-web-client": "tab-1" },
 			body: JSON.stringify({ clientId: "tab-1" }),
@@ -156,7 +175,7 @@ test("hub lists sessions and proxies each one under its own path prefix", async 
 		assert.equal(lease.status, 200);
 		await lease.body?.cancel();
 
-		const draft = await fetch(new URL(`${sessionBasePath("session-alpha")}api/draft`, hubUrl), {
+		const draft = await fetch(new URL(`${sessionApiPath("session-alpha")}draft`, hubUrl), {
 			method: "POST",
 			headers: { "content-type": "application/json", origin: hubUrl.slice(0, -1), "x-pi-web-client": "tab-1" },
 			body: JSON.stringify({ requestId: "draft-1", revision: 0, text: "hello from the browser" }),
@@ -164,7 +183,7 @@ test("hub lists sessions and proxies each one under its own path prefix", async 
 		assert.equal(draft.status, 200);
 		await draft.body?.cancel();
 
-		const sent = await fetch(new URL(`${sessionBasePath("session-alpha")}api/messages`, hubUrl), {
+		const sent = await fetch(new URL(`${sessionApiPath("session-alpha")}messages`, hubUrl), {
 			method: "POST",
 			headers: { "content-type": "application/json", origin: hubUrl.slice(0, -1), "x-pi-web-client": "tab-1" },
 			body: JSON.stringify({ requestId: "request-1", draftRevision: 1, delivery: "next" }),
@@ -176,8 +195,9 @@ test("hub lists sessions and proxies each one under its own path prefix", async 
 		// Routing must never leak a session's traffic to another session.
 		assert.equal(second.sends.length, 0);
 
-		// A cross-origin mutation is still refused by the owning session.
-		const hostile = await fetch(new URL(`${sessionBasePath("session-alpha")}api/lease`, hubUrl), {
+		// A cross-origin mutation never reaches the session: the hub forwards no validated origin,
+		// and the session's own check refuses it.
+		const hostile = await fetch(new URL(`${sessionApiPath("session-alpha")}lease`, hubUrl), {
 			method: "POST",
 			headers: { "content-type": "application/json", origin: "http://attacker.invalid", "x-pi-web-client": "tab-1" },
 			body: JSON.stringify({ clientId: "tab-1" }),
@@ -190,146 +210,143 @@ test("hub lists sessions and proxies each one under its own path prefix", async 
 	}
 });
 
-test("hub streams server-sent events through the proxy", async () => {
+test("hub streams a session's server-sent events through the channel", async () => {
 	const hub = await startHub({ port: 0 });
 	const hubUrl = `http://127.0.0.1:${hub.port}/`;
-	const sidecar = await createSidecar(hubUrl, "session-events");
+	const session = await createSession(hub, hubUrl, "session-events");
 	try {
-		await sidecar.connect();
-		const response = await fetch(new URL(`${sessionBasePath("session-events")}api/events?since=0`, hubUrl));
+		const response = await fetch(new URL(`${sessionApiPath("session-events")}events?since=0`, hubUrl));
 		assert.equal(response.status, 200);
 		assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
-		const text = await readSseUntil(response, "event: lease");
+		const reader = response.body?.getReader();
+		assert.ok(reader, "a streaming response must be readable");
+		const decoder = new TextDecoder();
+		let text = "";
+		for (let attempt = 0; attempt < 50 && !text.includes("event: lease"); attempt += 1) {
+			const chunk = await reader.read();
+			if (chunk.done) break;
+			text += decoder.decode(chunk.value, { stream: true });
+		}
+		assert.match(text, /retry: 2000/);
 		assert.match(text, /event: lease/);
+		// A streaming response must outlive the handler call that set it up: returning from the
+		// handler must not end the stream.
+		const closedEarly = await Promise.race([
+			reader.read().then((chunk) => chunk.done),
+			new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_500)),
+		]);
+		assert.equal(closedEarly, false, "the event stream closed instead of staying open");
+		await reader.cancel().catch(() => undefined);
 	} finally {
-		await sidecar.stop();
+		await session.stop();
 		await hub.close();
 	}
 });
 
-test("unknown, unregistered, and expired sessions answer with a readable page", async () => {
-	const hub = await startHub({ port: 0, ttlMs: 120, graceMs: 0 });
+test("a session whose channel dropped answers with a reconnecting page", async () => {
+	const hub = await startHub({ port: 0, channelWaitMs: 50, graceMs: 30_000 });
 	const hubUrl = `http://127.0.0.1:${hub.port}/`;
-	const sidecar = await createSidecar(hubUrl, "session-expiring");
+	const session = await createSession(hub, hubUrl, "session-reconnecting");
 	try {
 		const missing = await fetch(`${hubUrl}s/nobody-here/`);
 		assert.equal(missing.status, 404);
 		assert.match(await missing.text(), /not connected/);
 
-		await sidecar.connect();
-		await sidecar.client.stop();
-		await waitFor(() => hub.sessions().length === 0, "the hub should drop the unregistered session");
-		const gone = await fetch(`${hubUrl}${sessionBasePath("session-expiring").slice(1)}`);
-		assert.equal(gone.status, 404);
+		// The channel is the only registration path, so dropping it marks the session reconnecting.
+		session.channel.stop();
+		await waitFor(() => hub.sessions()[0]?.stale === true, "the hub marks a session without a channel");
+		const offline = await fetch(`${hubUrl}?session=session-reconnecting`);
+		assert.equal(offline.status, 200, "the page stays available while a session reconnects");
+		const api = await fetch(new URL(`${sessionApiPath("session-reconnecting")}state`, hubUrl));
+		assert.equal(api.status, 502);
+		assert.match(await api.text(), /reconnecting/);
 	} finally {
-		await sidecar.server.close();
+		await session.stop();
 		await hub.close();
 	}
 });
 
-test("a restarted hub is repopulated by heartbeats without touching Pi sessions", async () => {
+test("the hub forgets a session once its grace period passes", async () => {
+	const hub = await startHub({ port: 0, channelWaitMs: 50, graceMs: 50 });
+	const hubUrl = `http://127.0.0.1:${hub.port}/`;
+	const session = await createSession(hub, hubUrl, "session-forgotten");
+	try {
+		session.channel.stop();
+		await waitFor(() => hub.sessions().length === 0, "the hub forgets a session after its grace period");
+		const gone = await fetch(`${hubUrl}?session=session-forgotten`);
+		assert.equal(gone.status, 404);
+		assert.match(await gone.text(), /not connected/);
+	} finally {
+		await session.stop();
+		await hub.close();
+	}
+});
+
+test("a restarted hub is repopulated by reconnecting sessions", async () => {
 	const first = await startHub({ port: 0 });
 	const port = first.port;
 	const hubUrl = `http://127.0.0.1:${port}/`;
-	const sidecar = await createSidecar(hubUrl, "session-restart");
+	const session = await createSession(first, hubUrl, "session-restart");
 	try {
-		await sidecar.connect();
 		await first.close();
-
 		const replacement = await startHub({ port });
 		try {
-			await waitFor(async () => {
-				const response = await fetch(new URL(`${sessionBasePath("session-restart")}api/state`, hubUrl)).catch(
-					() => undefined,
-				);
-				if (!response) return false;
-				const ok = response.status === 200;
-				await response.body?.cancel();
-				return ok;
-			}, "the session should re-register with the replacement hub");
-			assert.equal(replacement.sessions().length, 1);
+			await waitFor(
+				() => replacement.sessions().length === 1 && replacement.sessions()[0]?.stale === false,
+				"the session reconnects to the replacement hub",
+			);
+			const state = await fetch(new URL(`${sessionApiPath("session-restart")}state`, hubUrl));
+			assert.equal(state.status, 200);
+			await state.body?.cancel();
 		} finally {
 			await replacement.close();
 		}
 	} finally {
-		await sidecar.stop();
+		await session.stop();
 	}
 });
 
-test("hub host validation and control-plane content types stay strict", async () => {
+test("hub host validation stays strict and the control plane is read-only", async () => {
 	// Allowed host names come from the configuration file, like every other hub setting.
 	const dir = mkdtempSync(join(tmpdir(), "pi-webui-hosts-"));
 	writeFileSync(join(dir, "pi-webui.json"), JSON.stringify({ hub: { allowedHosts: ["pi.example.com"] } }));
 	const hub = await startHub({ port: 0, env: { PI_CODING_AGENT_DIR: dir } });
 	const hubUrl = `http://127.0.0.1:${hub.port}/`;
 	try {
-		// `fetch` treats Host as a forbidden header, so drive these two probes with node:http.
+		// `fetch` treats Host as a forbidden header, so drive these probes with node:http.
 		assert.equal(await requestStatus(hub.port, "attacker.invalid"), 421);
 		assert.equal(await requestStatus(hub.port, `pi.example.com:${hub.port}`), 200);
 
-		const wrongType = await fetch(`${hubUrl}_hub/register`, {
-			method: "POST",
-			headers: { "content-type": "text/plain" },
-			body: "{}",
-		});
-		assert.equal(wrongType.status, 415);
-		await wrongType.body?.cancel();
+		const hello = (await (await fetch(`${hubUrl}_hub/hello`)).json()) as Record<string, unknown>;
+		assert.equal(hello.name, "pi-webui-hub");
+		assert.equal(hello.protocol, 2);
+		assert.equal(hello.port, hub.port);
+		assert.equal(hello.sessionCount, 0);
 
-		const invalid = await fetch(`${hubUrl}_hub/register`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ sessionId: "bad id", port: 70000, token: "nope" }),
-		});
-		assert.equal(invalid.status, 400);
-		await invalid.body?.cancel();
-
-		const hello: unknown = await (await fetch(`${hubUrl}_hub/hello`)).json();
-		assert.deepEqual(hello, { name: "pi-webui-hub", protocol: 1, port: hub.port, sessionCount: 0 });
-
-		// Reads are GETs; mutations stay POST-only with a JSON content type.
 		const sessionsRead = await fetch(`${hubUrl}_hub/sessions`);
 		assert.equal(sessionsRead.status, 200);
 		assert.deepEqual(await sessionsRead.json(), { sessions: [] });
-		const mutatingRead = await fetch(`${hubUrl}_hub/register`);
-		assert.equal(mutatingRead.status, 404);
-		await mutatingRead.body?.cancel();
+
+		// The old HTTP registration routes are gone: a channel is the only way in.
+		for (const path of ["_hub/register", "_hub/heartbeat", "_hub/unregister"]) {
+			const response = await fetch(`${hubUrl}${path}`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: "{}",
+			});
+			assert.equal(response.status, 404, `${path} must no longer exist`);
+			await response.body?.cancel();
+		}
 	} finally {
 		await hub.close();
-	}
-});
-
-test("hub sessions stay routable during the grace period after a missed heartbeat", async () => {
-	const hub: Hub = await startHub({ port: 0, ttlMs: 60, graceMs: 5_000 });
-	const hubUrl = `http://127.0.0.1:${hub.port}/`;
-	const conversation = new ConversationProjection({ id: "session-stale", cwd: "/workspace/demo", projectName: "demo" });
-	const server = await WebUIServer.start({ conversation, send: async () => ({ delivery: "immediate" }) });
-	try {
-		// Register without a heartbeat loop: the hub must keep routing to a session that went quiet
-		// until the grace period is over.
-		const registered = await fetch(`${hubUrl}_hub/register`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ sessionId: "session-stale", port: server.port, token: "d".repeat(40), projectName: "demo" }),
-		});
-		assert.equal(registered.status, 200);
-		await registered.body?.cancel();
-
-		await new Promise((resolve) => setTimeout(resolve, 150));
-		const summary = hub.sessions()[0];
-		assert.equal(summary?.stale, true, "a session past its TTL should be marked stale");
-		const stillRoutable = await fetch(new URL(`${sessionBasePath("session-stale")}api/state`, hubUrl));
-		assert.equal(stillRoutable.status, 200);
-		await stillRoutable.body?.cancel();
-	} finally {
-		await server.close();
-		await hub.close();
+		rmSync(dir, { recursive: true, force: true });
 	}
 });
 
 test("the session index page streams updates instead of reloading", async () => {
 	const hub = await startHub({ port: 0 });
 	const hubUrl = `http://127.0.0.1:${hub.port}/`;
-	const sidecar = await createSidecar(hubUrl, "session-streamed");
+	const session = await createSession(hub, hubUrl, "session-streamed");
 	try {
 		const page = await fetch(hubUrl);
 		const html = await page.text();
@@ -353,21 +370,21 @@ test("the session index page streams updates instead of reloading", async () => 
 		let text = decoder.decode((await reader.read()).value);
 		assert.match(text, /event: sessions/);
 
-		// Registering a session must push a new snapshot to the open stream.
-		await sidecar.client.start();
-		const pushed = await (async () => {
-			for (let attempt = 0; attempt < 50; attempt += 1) {
+		// Connecting another session must push a new snapshot to the open stream.
+		const extra = await createSession(hub, hubUrl, "session-pushed");
+		try {
+			for (let attempt = 0; attempt < 100 && !text.includes("session-pushed"); attempt += 1) {
 				const chunk = await reader.read();
 				if (chunk.done) break;
 				text += decoder.decode(chunk.value, { stream: true });
-				if (text.includes("session-streamed")) return text;
 			}
-			return text;
-		})();
-		assert.match(pushed, /session-streamed/);
+			assert.match(text, /session-pushed/);
+		} finally {
+			await extra.stop();
+		}
 		await reader.cancel().catch(() => undefined);
 	} finally {
-		await sidecar.stop();
+		await session.stop();
 		await hub.close();
 	}
 });
@@ -379,7 +396,8 @@ test("the hub and the extension agree by reading one configuration file", async 
 	writeFileSync(configPath, JSON.stringify({ hub: { port, allowedHosts: ["pi.example.com"] } }, null, 2));
 	const env = { PI_CODING_AGENT_DIR: dir };
 	const hub = await startHub({ env });
-	const sidecar = await createSidecar(`http://127.0.0.1:${hub.port}/`, "session-config");
+	const hubUrl = `http://127.0.0.1:${hub.port}/`;
+	const session = await createSession(hub, hubUrl, "session-config");
 	try {
 		// The service took its port from the file, with no flag and no environment variable.
 		assert.equal(hub.port, port);
@@ -390,17 +408,26 @@ test("the hub and the extension agree by reading one configuration file", async 
 		assert.deepEqual(read.issues, []);
 		assert.ok(read.config.allowedHosts.includes("pi.example.com"));
 
-		// A client with the same agent directory finds that exact port and registers.
-		const client = new HubClient(
-			{ metadata: () => ({ sessionId: "session-config", port: sidecar.server.port }) },
+		// An extension with the same agent directory derives that exact hub URL from the file.
+		const channel = new HubChannel({
 			env,
+			session: () => ({ sessionId: "session-config-derived" }),
+			serve: async () => undefined,
+			minRetryMs: 20,
+			maxRetryMs: 60,
+		});
+		assert.equal(channel.statusSnapshot().hubUrl, `http://127.0.0.1:${port}/`);
+		assert.equal(channel.channelUrl(), `ws://127.0.0.1:${port}/_hub/channel`);
+		channel.start();
+		await waitFor(() => channel.statusSnapshot().state === "connected", "the derived channel connects");
+		assert.equal(channel.sessionUrl(), `${hubUrl}?session=session-config-derived`);
+		channel.stop();
+		await waitFor(
+			() => hub.sessions().find((entry) => entry.sessionId === "session-config-derived")?.stale === true,
+			"the derived session is marked reconnecting after it stops",
 		);
-		assert.equal(client.statusSnapshot().hubUrl, `http://127.0.0.1:${port}/`);
-		await client.start();
-		assert.equal(client.statusSnapshot().state, "registered");
-		await client.stop();
 	} finally {
-		await sidecar.stop();
+		await session.stop();
 		await hub.close();
 		rmSync(dir, { recursive: true, force: true });
 	}
