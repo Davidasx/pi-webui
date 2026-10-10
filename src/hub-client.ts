@@ -45,7 +45,8 @@ export interface HubClientOptions {
 const DEFAULT_TIMEOUT_MS = 2_000;
 
 export class HubClient {
-	private readonly hubUrl: string;
+	private hubUrl: string;
+	private readonly env: NodeJS.ProcessEnv;
 	private readonly token: string;
 	private readonly fetchImpl: typeof fetch;
 	private readonly heartbeatIntervalMs: number;
@@ -58,7 +59,8 @@ export class HubClient {
 
 	constructor(options: HubClientOptions, env: NodeJS.ProcessEnv = process.env) {
 		this.metadata = options.metadata;
-		this.hubUrl = options.hubUrl ?? hubBaseUrl(env);
+		this.env = env;
+		this.hubUrl = options.hubUrl ?? hubBaseUrl({ env });
 		this.token = options.token ?? randomBytes(24).toString("hex");
 		this.fetchImpl = options.fetchImpl ?? fetch;
 		this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS;
@@ -113,6 +115,18 @@ export class HubClient {
 			.catch(() => undefined);
 	}
 
+	/**
+	 * Re-read the configuration file after a failed attempt: if someone changed the port and
+	 * restarted the service, a running session follows it instead of retrying a stale URL forever.
+	 */
+	private rediscoverHub(): void {
+		const resolved = hubBaseUrl({ env: this.env });
+		if (resolved !== this.hubUrl) {
+			this.hubUrl = resolved;
+			this.status = { ...this.status, hubUrl: resolved };
+		}
+	}
+
 	private async register(): Promise<void> {
 		const hello = await this.checkHello();
 		if (!hello.ok) {
@@ -131,6 +145,7 @@ export class HubClient {
 			}
 			this.markRegistered(response);
 		} catch (error) {
+			this.rediscoverHub();
 			this.update({ state: "unreachable", hubUrl: this.hubUrl, lastError: describeError(error) });
 		}
 	}
@@ -154,6 +169,7 @@ export class HubClient {
 			}
 			this.markRegistered(response);
 		} catch (error) {
+			this.rediscoverHub();
 			this.update({ state: "unreachable", hubUrl: this.hubUrl, lastError: describeError(error) });
 		}
 	}

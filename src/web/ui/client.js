@@ -55,6 +55,10 @@ let publishedTools = model.tools;
 let events;
 let reconnectTimer;
 let reconnectDelay = 500;
+// When data last arrived over the event stream. A proxy in front of the page can buffer or cut the
+// stream, and EventSource reports neither, so the client polls the snapshot while the stream is quiet.
+let lastEventAt = 0;
+const STREAM_STALL_MS = 5000;
 let snapshotRefresh;
 let snapshotTarget = 0;
 let draftSaveTimer;
@@ -173,6 +177,11 @@ async function initialize() {
 		await refreshSnapshot();
 		await claimLease();
 		connectEvents();
+		setInterval(() => {
+			if (model.closed || !model.connected) return;
+			if (Date.now() - lastEventAt <= STREAM_STALL_MS) return;
+			void refreshSnapshot().catch(connectionFailure);
+		}, STREAM_STALL_MS / 2).unref?.();
 	} catch (error) {
 		model = { ...model, connected: false, error: errorMessage(error) };
 		emit();
@@ -224,12 +233,14 @@ function connectEvents() {
 	events?.close();
 	events = new EventSource(`api/events?since=${model.sequence}`);
 	events.addEventListener("open", () => {
+		lastEventAt = Date.now();
 		reconnectDelay = 500;
 		model = { ...model, connected: true, error: "" };
 		if (model.textDirty) scheduleDraftSave();
 		emit();
 	});
 	events.addEventListener("conversation", (event) => {
+		lastEventAt = Date.now();
 		const conversationEvent = JSON.parse(event.data);
 		const previousMessages = model.messages;
 		const previousTools = model.tools;
@@ -265,6 +276,7 @@ function connectEvents() {
 		});
 	});
 	events.addEventListener("snapshot", (event) => {
+		lastEventAt = Date.now();
 		const snapshot = JSON.parse(event.data);
 		const replacesConversation =
 			Number.isSafeInteger(snapshot?.sequence) && snapshot.sequence >= model.sequence;

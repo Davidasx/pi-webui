@@ -22,6 +22,7 @@ const CLIENT_ID = /^[A-Za-z0-9_-]{1,80}$/;
 const REQUEST_ID = /^[A-Za-z0-9_-]{1,120}$/;
 const MAX_REQUESTS = 128;
 const DEFAULT_MAX_DRAFT_TEXT_BYTES = 1024 * 1024;
+const DEFAULT_SSE_KEEP_ALIVE_MS = 15_000;
 const SSE_FLUSH_TIMEOUT_MS = 250;
 const CSP_NONCE_PLACEHOLDER = "__PI_CSP_NONCE__";
 const BASE_HREF_PLACEHOLDER = "__PI_BASE_HREF__";
@@ -63,6 +64,8 @@ export interface WebUIServerOptions {
 	sentImageSettings?: SentImageSettings;
 	maxDraftTextBytes?: number;
 	maxRequestBytes?: number;
+	/** How often an idle event stream sends a comment, so proxies do not cut a quiet connection. */
+	sseKeepAliveMs?: number;
 }
 
 interface SseClient {
@@ -641,6 +644,17 @@ export class WebUIServer {
 		response.flushHeaders();
 		const client: SseClient = { response };
 		this.sseClients.add(client);
+		// An idle stream must still emit bytes: proxies (Cloudflare among them) drop or buffer a
+		// connection that goes quiet, and the comment keeps the path warm without reaching the page.
+		const keepAlive = setInterval(() => {
+			if (!response.write(": ping\n\n")) {
+				clearInterval(keepAlive);
+				this.sseClients.delete(client);
+			}
+		}, this.options.sseKeepAliveMs ?? DEFAULT_SSE_KEEP_ALIVE_MS);
+		keepAlive.unref?.();
+		response.once("close", () => clearInterval(keepAlive));
+		response.write("retry: 2000\n\n");
 		if (!response.write(": connected\n\n")) {
 			this.sseClients.delete(client);
 			response.end();

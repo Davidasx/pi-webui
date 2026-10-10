@@ -47,6 +47,9 @@ test("browser client claims a lease, reconnects, and keeps failed drafts through
 	assert.match(client, /completeSend/);
 	assert.match(client, /failSend/);
 	assert.match(client, /if \(!model\.leaseClaimed\) await claimLease\(\)/);
+	// A proxy in front of the page can buffer or cut the event stream without EventSource noticing.
+	assert.match(client, /STREAM_STALL_MS/);
+	assert.match(client, /void refreshSnapshot\(\).catch\(connectionFailure\)/);
 	assert.doesNotMatch(`${app}\n${client}`, /localStorage|sessionStorage|indexedDB/i);
 	// The hub serves every session under a path prefix, so the client must use relative URLs.
 	assert.doesNotMatch(`${app}\n${client}`, /["'`]\/api\//);

@@ -70,9 +70,8 @@ Type=simple
 ExecStart=/usr/bin/env node /path/to/pi-webui/bin/pi-webui-hub.mjs
 Restart=on-failure
 RestartSec=2
-Environment=PI_WEBUI_PORT=43118
-# Extra Host header names, needed only when a tunnel or reverse proxy fronts the hub.
-Environment=PI_WEBUI_ALLOWED_HOSTS=pi.example.com
+# 端口、绑定地址与允许的 Host 名字都在 ~/.pi/agent/pi-webui.json：
+#   { "hub": { "port": 43118, "allowedHosts": ["pi.example.com"] } }
 NoNewPrivileges=true
 PrivateTmp=true
 
@@ -112,23 +111,19 @@ npm run hub            # 或者：pi-webui-hub --port 43118
 ## 安全模型
 
 - **不提供鉴权是刻意设计。** 任何本地进程都可以通过 Hub 驱动已注册的会话，所以请把该端口视同于「能直接对着终端打字」。把它留在回环地址上。
-- **Host 校验。** Hub 只回应 `127.0.0.1`、`localhost`、`::1`，以及 `PI_WEBUI_ALLOWED_HOSTS` 里列出的主机名；其他一律 `421`，这同时挡住了 DNS rebinding。
+- **Host 校验。** Hub 只回应 `127.0.0.1`、`localhost`、`::1`，以及配置文件里 `hub.allowedHosts` 列出的主机名；其他一律 `421`，这同时挡住了 DNS rebinding。
 - **Origin 校验。** 会话级写操作必须携带会话自身的 Origin；Hub 在转发前把自己校验通过的浏览器 Origin 改写为会话 Origin，因此来自其他 Origin 的页面（包括你浏览器里某个恶意网页）会被 `403` 拒绝。
 - **跨源的控制面写入被阻断。** `/_hub/register|heartbeat|unregister` 要求 JSON content type，跨源页面必须先发预检请求，而 Hub 从不回应预检，所以写操作发不出去。
 - **页面带有严格 CSP**，并用每次响应生成的 nonce；会话页保留它自己的 nonce 策略（没有 CDN、没有远程服务、不使用浏览器存储）。
-- **远程访问由你自己加。** 用带鉴权的隧道或反向代理（Cloudflare Zero Trust、SSH 隧道、mTLS……）挡在 Hub 前面，并把它的主机名加进 `PI_WEBUI_ALLOWED_HOSTS`。pi-webui 不会自己长出一套鉴权。
+- **远程访问由你自己加。** 用带鉴权的隧道或反向代理（Cloudflare Zero Trust、SSH 隧道、mTLS……）挡在 Hub 前面，并把它的主机名写进配置文件里的 `hub.allowedHosts`。pi-webui 不会自己长出一套鉴权。
 
 ## 配置
 
-| 变量 | 默认值 | 含义 |
-| --- | --- | --- |
-| `PI_WEBUI_PORT` | `43118` | Hub 固定端口（写在 unit 里） |
-| `PI_WEBUI_HOST` | `127.0.0.1` | Hub 监听地址 |
-| `PI_WEBUI_ALLOWED_HOSTS` | — | 逗号分隔的额外 `Host` 主机名（代理/隧道） |
-| `PI_WEBUI_HUB_URL` | 由 `PI_WEBUI_PORT` 推导 | 扩展使用的 Hub 完整基地址 |
-| `PI_WEBUI_HUB_QUIET` | — | `1` 降低 Hub 日志量 |
+**没有任何 `pi-webui` 环境变量。** 一个文件同时是 Hub 服务和扩展的唯一事实来源：
 
-扩展设置只有一个全局文件：`<getAgentDir()>/pi-webui.json`（通常是 `~/.pi/agent/pi-webui.json`）：
+```text
+$PI_CODING_AGENT_DIR/pi-webui.json      # 未设置时是 ~/.pi/agent/pi-webui.json
+```
 
 ```json
 {
@@ -137,11 +132,32 @@ npm run hub            # 或者：pi-webui-hub --port 43118
   "maxImages": 8,
   "maxImageBytes": 10485760,
   "maxBatchBytes": 41943040,
-  "maxImagePixels": 50000000
+  "maxImagePixels": 50000000,
+  "hub": {
+    "port": 43118,
+    "allowedHosts": ["pi.example.com"]
+  }
 }
 ```
 
-`startOnSessionStart` 会在每次会话初始化（启动、reload、new、resume、fork）时自动发布会话，而不必等 `/webui open`。JSON 格式错误时文件会被原样保留、忽略并给出警告，绝不会被重写；`/webui status` 会报告生效值与它们的来源。
+| 键 | 默认值 | 含义 |
+| --- | --- | --- |
+| `hub.port` | `43118` | Hub 服务监听、扩展连接的端口 |
+| `hub.allowedHosts` | 仅回环 | 额外回应的 `Host` 名字（隧道或反向代理） |
+| `startOnSessionStart` | `false` | 每次会话初始化时自动发布会话 |
+
+Hub 只绑 `127.0.0.1`，暴露出去是隧道的事，不是配置项。两个进程读同一个文件的同一套规则，所以改 `hub.port` 既不用改 systemd unit，也不需要 `daemon-reload`：写好文件，重启服务即可：
+
+```bash
+systemctl --user restart pi-webui-hub.service
+```
+
+正在运行的会话会自己跟过去：扩展在一次心跳失败后会重新读这个文件。`/webui status` 会打印生效端口、来源和文件路径；`/webui settings` 可以直接改端口。
+
+调试时 Hub 另外接受 `--port <port>` 与 `--host <host>`，只对那一次运行生效。扩展永远读文件，所以临时的 `--port` 只适合配合 Hub 启动时打印的直连 URL 使用。
+
+`startOnSessionStart` 会在每次会话初始化（启动、reload、new、resume、fork）时自动发布会话，而不必等 `/webui open`。JSON 格式错误，或 `hub` 的类型不对时，文件会被原样保留、忽略并给出警告；`/webui status` 会报告生效值与文件路径。扩展在写入前严格校验（识别到的字段非法会把菜单导向修复流程），Hub 则在日志里报告问题并以默认端口启动，而不是拒绝运行。
+
 
 ## 协议（给工具用）
 
@@ -170,6 +186,22 @@ npm run hub         # 前台运行 Hub
 ```
 
 结构：`src/hub.ts`（路由器，由 Node 通过类型擦除直接执行）、`src/hub-client.ts`（注册/心跳）、`src/hub-protocol.ts`（共享契约）、`src/server.ts`（会话内服务器）、`src/runtime.ts`（Pi 集成）、`src/web/ui/*`（React 客户端，打包进 `src/web/app.js`）。
+
+## 放在反向代理或隧道后面
+
+页面的实时性靠 Server-Sent Events，而 Cloudflare 的边缘对它并不完全可靠：已知会缓冲 `text/event-stream`（事件延迟到达，或等到连接关闭才一次性到达），并且会把空闲约 100 秒的流切断。Hub 与前端都按「这些都不该让页面变旧」来设计：
+
+- 空闲的流每 15 秒发一条 keep-alive 注释（索引流与会话流都是 15 秒），既保温也避开空闲切断；EventSource 在断开后 2 秒重连。
+- Hub 每 3 秒推一次会话快照，哪怕没有任何变化，这样浏览器端才能区分「安静」和「死了」。
+- 索引流静默 8 秒后，索引页会退化为每 3 秒轮询一次 `/_hub/sessions`，并在端口旁边显示 `polling`；事件恢复后自动回到 `live`。
+- 会话页同理：流上 5 秒没有数据时，它改用普通请求拉一次完整快照，所以被缓冲的流不会让正在进行的回合看起来卡死。
+
+如果隧道下面流式仍然不正常，按通常有效的顺序排查：
+
+1. 用**命名隧道**，别用快速隧道（`trycloudflare.com`）：快速隧道对 `GET` 流是故意缓冲的。
+2. 确认响应没有被压缩。页面本身已经发了 `Cache-Control: no-store` 和 `X-Accel-Buffering: no`，但如果你为该主机名开了 Brotli/压缩，需要加一条 Configuration Rule 关掉它。
+3. 装在 **Cloudflare Access** 后面时，`CF_Authorization` cookie 必须能到达 `/_hub/events` 请求 —— 正常浏览器会话下没问题。如果你改用 service token 或纯 header 策略，页面能打开，但事件流会 403，此时只有轮询兜底在维持更新。
+4. 如果长时间流式是硬需求，就把 TLS 终结在流式正常的地方（普通反向代理，或只把 Hub 走灰云主机名）。
 
 ## 需要知道的行为
 

@@ -1,10 +1,20 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "vitest";
 import { ConversationProjection } from "../src/conversation.js";
 import { type Hub, startHub } from "../src/hub.js";
 import { HubClient } from "../src/hub-client.js";
-import { SESSION_PATH_PREFIX, sessionBasePath } from "../src/hub-protocol.js";
+import {
+	configFilePath,
+	DEFAULT_ALLOWED_HOSTS,
+	DEFAULT_HUB_PORT,
+	readHubConfig,
+	SESSION_PATH_PREFIX,
+	sessionBasePath,
+} from "../src/hub-protocol.js";
 import { type WebSendRequest, WebUIServer } from "../src/server.js";
 
 interface Sidecar {
@@ -82,6 +92,19 @@ function requestStatus(port: number, host: string): Promise<number> {
 		});
 		request.once("error", reject);
 		request.end();
+	});
+}
+
+/** An ephemeral port that was just released, so the hub can be told to bind a real number. */
+function freePort(): Promise<number> {
+	return new Promise((resolve, reject) => {
+		const probe = http.createServer();
+		probe.once("error", reject);
+		probe.listen(0, "127.0.0.1", () => {
+			const address = probe.address();
+			const port = address && typeof address !== "string" ? address.port : 0;
+			probe.close(() => resolve(port));
+		});
 	});
 }
 
@@ -234,7 +257,10 @@ test("a restarted hub is repopulated by heartbeats without touching Pi sessions"
 });
 
 test("hub host validation and control-plane content types stay strict", async () => {
-	const hub = await startHub({ port: 0, allowedHosts: ["127.0.0.1", "localhost", "pi.example.com"] });
+	// Allowed host names come from the configuration file, like every other hub setting.
+	const dir = mkdtempSync(join(tmpdir(), "pi-webui-hosts-"));
+	writeFileSync(join(dir, "pi-webui.json"), JSON.stringify({ hub: { allowedHosts: ["pi.example.com"] } }));
+	const hub = await startHub({ port: 0, env: { PI_CODING_AGENT_DIR: dir } });
 	const hubUrl = `http://127.0.0.1:${hub.port}/`;
 	try {
 		// `fetch` treats Host as a forbidden header, so drive these two probes with node:http.
@@ -342,6 +368,93 @@ test("the session index page streams updates instead of reloading", async () => 
 		await reader.cancel().catch(() => undefined);
 	} finally {
 		await sidecar.stop();
+		await hub.close();
+	}
+});
+
+test("the hub and the extension agree by reading one configuration file", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-webui-config-"));
+	const configPath = join(dir, "pi-webui.json");
+	const port = await freePort();
+	writeFileSync(configPath, JSON.stringify({ hub: { port, allowedHosts: ["pi.example.com"] } }, null, 2));
+	const env = { PI_CODING_AGENT_DIR: dir };
+	const hub = await startHub({ env });
+	const sidecar = await createSidecar(`http://127.0.0.1:${hub.port}/`, "session-config");
+	try {
+		// The service took its port from the file, with no flag and no environment variable.
+		assert.equal(hub.port, port);
+		const read = readHubConfig({ env });
+		assert.equal(read.path, configPath);
+		assert.equal(read.config.port, port);
+		assert.equal(read.portFromFile, true);
+		assert.deepEqual(read.issues, []);
+		assert.ok(read.config.allowedHosts.includes("pi.example.com"));
+
+		// A client with the same agent directory finds that exact port and registers.
+		const client = new HubClient(
+			{ metadata: () => ({ sessionId: "session-config", port: sidecar.server.port }) },
+			env,
+		);
+		assert.equal(client.statusSnapshot().hubUrl, `http://127.0.0.1:${port}/`);
+		await client.start();
+		assert.equal(client.statusSnapshot().state, "registered");
+		await client.stop();
+	} finally {
+		await sidecar.stop();
+		await hub.close();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("readHubConfig reports unusable values and falls back without refusing to start", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-webui-config-"));
+	const configPath = join(dir, "pi-webui.json");
+	try {
+		assert.equal(readHubConfig({ env: { PI_CODING_AGENT_DIR: dir } }).config.port, DEFAULT_HUB_PORT);
+		assert.equal(readHubConfig({ env: { PI_CODING_AGENT_DIR: dir } }).exists, false);
+
+		writeFileSync(configPath, "{ not json");
+		const malformed = readHubConfig({ env: { PI_CODING_AGENT_DIR: dir } });
+		assert.equal(malformed.config.port, DEFAULT_HUB_PORT);
+		assert.equal(malformed.issues.length, 1);
+
+		writeFileSync(configPath, JSON.stringify({ hub: { port: 70_000, allowedHosts: ["ok.example", 7] } }));
+		const invalid = readHubConfig({ env: { PI_CODING_AGENT_DIR: dir } });
+		assert.equal(invalid.config.port, DEFAULT_HUB_PORT, "an out-of-range port falls back to the default");
+		assert.equal(invalid.portFromFile, false);
+		assert.equal(invalid.issues.length, 2);
+		assert.deepEqual(invalid.config.allowedHosts, [...DEFAULT_ALLOWED_HOSTS, "ok.example"]);
+
+		writeFileSync(configPath, JSON.stringify({ hub: "not-an-object" }));
+		assert.equal(readHubConfig({ env: { PI_CODING_AGENT_DIR: dir } }).config.port, DEFAULT_HUB_PORT);
+
+		// Pi's own agent directory convention, with no pi-webui variable of our own.
+		assert.equal(configFilePath({ PI_CODING_AGENT_DIR: "/opt/agent" }), "/opt/agent/pi-webui.json");
+		assert.equal(configFilePath({ HOME: "/home/someone" }), "/home/someone/.pi/agent/pi-webui.json");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("the index keeps ticking so a silent stream is detectable", async () => {
+	const hub = await startHub({ port: 0, tickMs: 40 });
+	const hubUrl = `http://127.0.0.1:${hub.port}/`;
+	try {
+		const response = await fetch(`${hubUrl}_hub/events`);
+		const reader = response.body?.getReader();
+		assert.ok(reader);
+		const decoder = new TextDecoder();
+		let text = decoder.decode((await reader.read()).value);
+		const first = text.length;
+		for (let attempt = 0; attempt < 50 && text.length === first; attempt += 1) {
+			const chunk = await reader.read();
+			if (chunk.done) break;
+			text += decoder.decode(chunk.value, { stream: true });
+		}
+		assert.ok(text.length > first, "a quiet registry should still produce periodic snapshots");
+		assert.match(text, /retry: 2000/);
+		await reader.cancel().catch(() => undefined);
+	} finally {
 		await hub.close();
 	}
 });

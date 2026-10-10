@@ -16,15 +16,16 @@ import { Agent, createServer, type IncomingMessage, request as proxyRequest, typ
 import { pathToFileURL } from "node:url";
 
 import {
+	CONFIG_FILE_NAME,
 	DEFAULT_HUB_PORT,
 	EVENTS_PATH,
-	HEARTBEAT_INTERVAL_MS,
 	HEARTBEAT_PATH,
 	HELLO_PATH,
 	HUB_NAME,
 	HUB_PROTOCOL,
 	type HubActivity,
 	REGISTER_PATH,
+	readHubConfig,
 	SESSION_PATH_PREFIX,
 	SESSIONS_PATH,
 	sessionBasePath,
@@ -33,15 +34,14 @@ import {
 
 export type { HubActivity } from "./hub-protocol.ts";
 export { DEFAULT_HUB_PORT, HUB_NAME, HUB_PROTOCOL } from "./hub-protocol.ts";
-/** Heartbeat interval the extension uses; exported so both sides agree. */
-export const HUB_HEARTBEAT_INTERVAL_MS = HEARTBEAT_INTERVAL_MS;
+
+/** How often open index streams are refreshed, so a silent stream is detectable. */
+const SESSION_TICK_MS = 3_000;
 
 /** How long a registration survives without a heartbeat. */
 const SESSION_TTL_MS = 10_000;
 /** How long an expired session stays routable (so a brief stall does not blank a browser tab). */
 const SESSION_GRACE_MS = 30_000;
-/** Extra hostnames allowed in the Host header, for a user-provided reverse proxy or tunnel. */
-const DEFAULT_ALLOWED_HOSTS = ["127.0.0.1", "localhost", "[::1]", "::1"];
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
 const TOKEN_PATTERN = /^[a-f0-9]{16,128}$/;
 const MAX_BODY_BYTES = 64 * 1024;
@@ -97,12 +97,24 @@ export interface HubLogger {
 }
 
 export interface HubOptions {
+	/** Debug override; the configuration file owns the persistent port. */
 	port?: number;
+	/** Debug override; the persistent bind address is always loopback. */
 	host?: string;
-	allowedHosts?: readonly string[];
+	/**
+	 * Environment used to locate the configuration file (`PI_CODING_AGENT_DIR`, else `~/.pi/agent`).
+	 * Tests set it; production always reads the real process environment.
+	 */
+	env?: NodeJS.ProcessEnv;
 	logger?: HubLogger;
 	ttlMs?: number;
 	graceMs?: number;
+	/**
+	 * How often every open index stream is refreshed even when nothing changed. This keeps the
+	 * browser able to tell "no news" from "the stream died behind a proxy", and keeps intermediaries
+	 * that buffer or time out idle streams from going silent.
+	 */
+	tickMs?: number;
 	/**
 	 * Keep the process alive through the listening server. The CLI sets this; tests leave it off so
 	 * they can close a hub deterministically without holding the test runner open.
@@ -119,8 +131,7 @@ export interface Hub {
 
 const silentLogger: HubLogger = { info: () => undefined, error: () => undefined };
 
-function createLogger(quiet: boolean): HubLogger {
-	if (quiet) return silentLogger;
+function createLogger(): HubLogger {
 	const stamp = () => new Date().toISOString().slice(11, 19);
 	return {
 		info: (message) => console.log(`[${stamp()}] ${message}`),
@@ -337,8 +348,24 @@ function landingPage(sessions: readonly HubSessionSummary[], port: number, nonce
 			if (age) age.textContent = ago((now - session.lastSeen) / 1000);
 		}
 	};
+	// The stream is the fast path, but a proxy in front of the hub may buffer it (Cloudflare does
+	// under load) or cut it while idle. Track when data last arrived and fall back to plain polling,
+	// so the list is never silently stale.
+	let lastEventAt = Date.now();
+	const STALL_MS = 8000;
+	const refresh = async () => {
+		try {
+			const response = await fetch("/_hub/sessions", { cache: "no-store" });
+			const payload = await response.json();
+			sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+			render();
+		} catch {
+			status.textContent = "offline";
+		}
+	};
 	const events = new EventSource("/_hub/events");
 	events.addEventListener("sessions", (event) => {
+		lastEventAt = Date.now();
 		sessions = JSON.parse(event.data);
 		status.textContent = "live";
 		render();
@@ -349,6 +376,12 @@ function landingPage(sessions: readonly HubSessionSummary[], port: number, nonce
 	events.addEventListener("error", () => {
 		status.textContent = "reconnecting";
 	});
+	setInterval(() => {
+		if (Date.now() - lastEventAt > STALL_MS) {
+			status.textContent = "polling";
+			void refresh();
+		}
+	}, 3000);
 	setInterval(refreshAges, 1000);
 	render();
 })();`;
@@ -415,10 +448,11 @@ It may have exited, or the hub may have restarted before the session's next hear
 }
 
 export async function startHub(options: HubOptions = {}): Promise<Hub> {
+	const config = readHubConfig({ env: options.env });
 	const host = options.host ?? "127.0.0.1";
 	const ttlMs = options.ttlMs ?? SESSION_TTL_MS;
 	const graceMs = options.graceMs ?? SESSION_GRACE_MS;
-	const allowedHosts = options.allowedHosts ?? DEFAULT_ALLOWED_HOSTS;
+	const allowedHosts = config.config.allowedHosts;
 	const logger = options.logger ?? silentLogger;
 	const sessions = new Map<string, SessionRecord>();
 	/** Open index streams (`/_hub/events`); the landing page subscribes instead of reloading. */
@@ -469,7 +503,7 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 		const hostHeader = request.headers.host;
 		if (!hostAllowed(hostHeader, allowedHosts)) {
 			sendJson(response, 421, {
-				error: `Unexpected Host header. Add it to PI_WEBUI_ALLOWED_HOSTS to serve behind a proxy.`,
+				error: `Unexpected Host header. Add the host name to "hub.allowedHosts" in ${config.path} to serve behind a proxy.`,
 			});
 			return;
 		}
@@ -645,7 +679,8 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 		});
 		response.flushHeaders();
 		eventClients.add(response);
-		response.write(`event: sessions\ndata: ${JSON.stringify(listSessions())}\n\n`);
+		// EventSource reconnects quickly after an edge cut (Cloudflare ends idle streams at ~100s).
+		response.write(`retry: 2000\nevent: sessions\ndata: ${JSON.stringify(listSessions())}\n\n`);
 		const keepAlive = setInterval(() => {
 			if (!response.write(": ping\n\n")) {
 				clearInterval(keepAlive);
@@ -743,6 +778,7 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 		return index === -1 ? "" : raw.slice(index);
 	}
 
+
 	function serverPort(): number {
 		const address = server.address();
 		return address && typeof address !== "string" ? address.port : 0;
@@ -750,7 +786,7 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
-		server.listen(options.port ?? DEFAULT_HUB_PORT, host, () => {
+		server.listen(options.port ?? config.config.port, host, () => {
 			server.off("error", reject);
 			resolve();
 		});
@@ -766,8 +802,10 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 			}
 		}
 	}, 2_000);
+	const tick = setInterval(() => broadcastSessions(), options.tickMs ?? SESSION_TICK_MS);
 	if (!options.keepAlive) {
 		sweep.unref();
+		tick.unref();
 		server.unref();
 	}
 
@@ -777,6 +815,7 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 		sessions: listSessions,
 		close: async () => {
 			clearInterval(sweep);
+			clearInterval(tick);
 			sessions.clear();
 			for (const client of eventClients) client.end();
 			eventClients.clear();
@@ -788,35 +827,26 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 }
 
 export interface HubCliOptions {
-	port: number;
-	host: string;
-	quiet: boolean;
-	allowedHosts: readonly string[];
+	/** Present only when `--port` was passed; otherwise the configuration file decides. */
+	port?: number;
+	host?: string;
 }
 
-export function parseHubArgs(argv: readonly string[], env: NodeJS.ProcessEnv = process.env): HubCliOptions {
-	let port = Number.parseInt(env.PI_WEBUI_PORT ?? "", 10);
-	let host = env.PI_WEBUI_HOST?.trim() || "127.0.0.1";
-	let quiet = env.PI_WEBUI_HUB_QUIET === "1";
-	const allowedHosts = [...DEFAULT_ALLOWED_HOSTS];
-	for (const extra of (env.PI_WEBUI_ALLOWED_HOSTS ?? "").split(",")) {
-		const value = extra.trim().toLowerCase();
-		if (value) allowedHosts.push(value);
-	}
-
+/** Debug flags only. Everything persistent lives in the configuration file, never in the environment. */
+export function parseHubArgs(argv: readonly string[]): HubCliOptions {
+	let port: number | undefined;
+	let host: string | undefined;
 	for (let index = 0; index < argv.length; index += 1) {
 		const arg = argv[index];
-		if (arg === "--help" || arg === "-h") {
-			throw new HubCliHelp();
-		}
-		if (arg === "--quiet" || arg === "-q") {
-			quiet = true;
-			continue;
-		}
+		if (arg === "--help" || arg === "-h") throw new HubCliHelp();
 		const next = argv[index + 1];
 		if (arg === "--port" || arg === "-p") {
 			if (!next) throw new Error("--port requires a value");
-			port = Number.parseInt(next, 10);
+			const parsed = Number.parseInt(next, 10);
+			if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65_535) {
+				throw new Error("--port must be an integer between 1 and 65535");
+			}
+			port = parsed;
 			index += 1;
 			continue;
 		}
@@ -826,17 +856,9 @@ export function parseHubArgs(argv: readonly string[], env: NodeJS.ProcessEnv = p
 			index += 1;
 			continue;
 		}
-		if (arg === "--allow-host") {
-			if (!next) throw new Error("--allow-host requires a value");
-			allowedHosts.push(next.trim().toLowerCase());
-			index += 1;
-			continue;
-		}
 		throw new Error(`Unknown argument: ${arg}`);
 	}
-
-	if (!Number.isInteger(port) || port < 0 || port > 65535) port = DEFAULT_HUB_PORT;
-	return { port, host, quiet, allowedHosts };
+	return { ...(port !== undefined ? { port } : {}), ...(host !== undefined ? { host } : {}) };
 }
 
 export class HubCliHelp extends Error {
@@ -848,13 +870,22 @@ export class HubCliHelp extends Error {
 export const HUB_USAGE = `pi-webui-hub — fixed-port router for pi-webui sessions
 
 Usage:
-  pi-webui-hub [--port <port>] [--host <host>] [--allow-host <hostname>] [--quiet]
+  pi-webui-hub [--port <port>] [--host <host>]
 
-Environment:
-  PI_WEBUI_PORT            listen port (default ${DEFAULT_HUB_PORT})
-  PI_WEBUI_HOST            bind address (default 127.0.0.1)
-  PI_WEBUI_ALLOWED_HOSTS   comma-separated extra Host header names, for a tunnel or reverse proxy
-  PI_WEBUI_HUB_QUIET=1     reduce logging
+The port comes from ${CONFIG_FILE_NAME} in Pi's agent directory (${"$"}PI_CODING_AGENT_DIR, else
+~/.pi/agent):
+
+  {
+    "hub": {
+      "port": ${DEFAULT_HUB_PORT},
+      "allowedHosts": ["pi.example.com"]
+    }
+  }
+
+--port and --host override that file for one debugging run; the extension always reads the file, so
+a different --port is only useful together with the direct URL the hub prints. Both the hub and the
+extension read the same file: change it and restart the service
+(systemctl --user restart pi-webui-hub.service) — no daemon-reload.
 
 The hub only routes requests to registered Pi sessions. It never starts, reads, or writes a Pi
 session, so running it alongside terminal Pi processes cannot conflict with them.
@@ -864,10 +895,10 @@ export function generateSessionToken(): string {
 	return randomBytes(24).toString("hex");
 }
 
-export async function runHubCli(argv: readonly string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {
+export async function runHubCli(argv: readonly string[]): Promise<number> {
 	let options: HubCliOptions;
 	try {
-		options = parseHubArgs(argv, env);
+		options = parseHubArgs(argv);
 	} catch (error) {
 		if (error instanceof HubCliHelp) {
 			process.stdout.write(HUB_USAGE);
@@ -877,15 +908,20 @@ export async function runHubCli(argv: readonly string[], env: NodeJS.ProcessEnv 
 		return 2;
 	}
 
-	const logger = createLogger(options.quiet);
+	const logger = createLogger();
 	const hub = await startHub({
-		port: options.port,
-		host: options.host,
-		allowedHosts: options.allowedHosts,
+		...(options.port !== undefined ? { port: options.port } : {}),
+		...(options.host !== undefined ? { host: options.host } : {}),
 		logger,
 		keepAlive: true,
 	});
-	logger.info(`${HUB_NAME} listening on ${hub.url}`);
+	const config = readHubConfig();
+	for (const issue of config.issues) logger.error(issue);
+	logger.info(
+		`${HUB_NAME} listening on ${hub.url} (config ${config.path}: port ${
+			config.portFromFile ? config.config.port : `${DEFAULT_HUB_PORT} by default`
+		})`,
+	);
 
 	let closing = false;
 	const shutdown = async (signal: string) => {

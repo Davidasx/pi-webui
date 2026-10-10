@@ -11,7 +11,13 @@ import type { PreparedAttachment } from "./attachments.js";
 import { ConversationProjection, projectBranchMessages } from "./conversation.js";
 import { HubClient, type HubClientOptions, type HubClientStatus } from "./hub-client.js";
 import { HUB_UNIT_NAME, hubInstallSteps, packageVersion, renderHubUnit } from "./hub-install.js";
-import { type HubRegistration, hubBaseUrl } from "./hub-protocol.js";
+import {
+	CONFIG_FILE_NAME,
+	type HubConfigRead,
+	type HubRegistration,
+	hubBaseUrl,
+	readHubConfig,
+} from "./hub-protocol.js";
 import { DEFAULT_IMAGE_LIMITS, type ImageLimits, imageLimits } from "./image-limits.js";
 import {
 	type BrowserImageInput,
@@ -440,6 +446,38 @@ export class WebUIRuntime {
 		};
 	}
 
+	/**
+	 * Serialize one settings patch through the save queue, mirroring the accepted document back into
+	 * memory. Shared by every editable row so they cannot drift in locking, validation, or error text.
+	 */
+	private async persistSettings(
+		patch: Partial<WebUISettings>,
+		ctx: ExtensionCommandContext,
+		generation: number,
+	): Promise<boolean> {
+		let accepted = false;
+		const operation = this.settingsSaveQueue.then(async () => {
+			if (!this.settingsDocument) {
+				throw new Error("the invalid settings file must be repaired manually first");
+			}
+			const document = await this.dependencies.saveSettings(patch, this.settingsDocument, this.settingsPath);
+			if (generation !== this.generation || this.closed) return;
+			this.settings = { ...this.settings, ...patch };
+			this.settingsDocument = document;
+			this.settingsSource = "settings file";
+			accepted = true;
+		});
+		this.settingsSaveQueue = operation.catch(() => undefined);
+		try {
+			await operation;
+		} catch (error) {
+			if (generation === this.generation && !this.closed) {
+				ctx.ui.notify(`WebUI settings save failed: ${formatError(error)}`, "error");
+			}
+		}
+		return accepted;
+	}
+
 	private async showMenu(ctx: ExtensionCommandContext): Promise<void> {
 		if (!ctx.hasUI) return;
 		await this.runStandardMenu(ctx, "main");
@@ -467,8 +505,8 @@ export class WebUIRuntime {
 		const isCurrent = () => generation === this.generation && !this.closed && !menuSignal.aborted;
 		const { defineMenu, runMenu } = await import("@narumitw/pi-tui-kit");
 		if (!isCurrent()) return;
-		type Screen = "main" | "settings" | "repair" | "status" | "help";
-		type Action = "open" | "settings" | "save-startup";
+		type Screen = "main" | "settings" | "hub-port" | "repair" | "status" | "help";
+		type Action = "open" | "settings" | "save-startup" | "edit-hub-port" | "save-hub-port";
 		const menu = defineMenu<undefined, Screen, Action, ExtensionCommandContext>({
 			start,
 			screens: {
@@ -506,7 +544,26 @@ export class WebUIRuntime {
 							values: ["Manual", "Every session"],
 							action: "save-startup",
 						},
+						{
+							id: "hubPort",
+							label: "Hub port",
+							description: "The port both the hub service and this extension read from this file",
+							currentValue: String(this.settings.hubPort),
+							action: "edit-hub-port",
+						},
 					],
+				}),
+				"hub-port": () => ({
+					kind: "input",
+					title: "Hub port",
+					lines: [
+						"The port the hub service listens on and this extension connects to.",
+						`Saved to ${safeTerminalText(this.settingsPath)}; restart the service to apply it: systemctl --user restart pi-webui-hub.service`,
+					],
+					placeholder: String(this.settings.hubPort),
+					initialValue: String(this.settings.hubPort),
+					action: "save-hub-port",
+					hint: "back",
 				}),
 				repair: () => ({
 					kind: "detail",
@@ -540,32 +597,28 @@ export class WebUIRuntime {
 					}
 					return { kind: "to", screen: "settings" };
 				},
+				"edit-hub-port": async () => {
+					if (this.settingsDocument === undefined) return { kind: "to", screen: "repair" };
+					return { kind: "to", screen: "hub-port" };
+				},
+				"save-hub-port": async ({ value }) => {
+					const parsed = Number.parseInt(String(value).trim(), 10);
+					if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 65_535) {
+						ctx.ui.notify("The hub port must be an integer between 1 and 65535.", "error");
+						return { kind: "stay" };
+					}
+					const accepted = await this.persistSettings({ hubPort: parsed }, ctx, generation);
+					if (accepted) {
+						ctx.ui.notify(
+							`Hub port is now ${parsed}. Restart the service to apply it: systemctl --user restart ${HUB_UNIT_NAME}`,
+							"info",
+						);
+					}
+					return accepted ? { kind: "stay" } : { kind: "rejected" };
+				},
 				"save-startup": async ({ value }) => {
 					const requested = value === "Every session";
-					let accepted = false;
-					const operation = this.settingsSaveQueue.then(async () => {
-						if (!this.settingsDocument) {
-							throw new Error("the invalid settings file must be repaired manually first");
-						}
-						const document = await this.dependencies.saveSettings(
-							{ startOnSessionStart: requested },
-							this.settingsDocument,
-							this.settingsPath,
-						);
-						if (generation !== this.generation || this.closed) return;
-						this.settings = { ...this.settings, startOnSessionStart: requested };
-						this.settingsDocument = document;
-						this.settingsSource = "settings file";
-						accepted = true;
-					});
-					this.settingsSaveQueue = operation.catch(() => undefined);
-					try {
-						await operation;
-					} catch (error) {
-						if (generation === this.generation && !this.closed) {
-							ctx.ui.notify(`WebUI settings save failed: ${formatError(error)}`, "error");
-						}
-					}
+					const accepted = await this.persistSettings({ startOnSessionStart: requested }, ctx, generation);
 					return accepted ? { kind: "stay" } : { kind: "rejected" };
 				},
 			},
@@ -583,6 +636,7 @@ export class WebUIRuntime {
 		return [
 			`Server: ${this.server ? `Running on ${this.server.origin}` : "Stopped"}`,
 			`Hub: ${hubStatusLine(this.hubStatus)}`,
+			`Hub settings: ${hubSettingsLine()}`,
 			...(this.hubStatus.sessionUrl ? [`Link: ${this.hubStatus.sessionUrl}`] : []),
 			`Startup: ${this.settings.startOnSessionStart ? "Every session" : "Manual"} (${source})`,
 			`Image limits (${source}): ${this.effectiveImageLimits.maxImages} images, ${formatMib(this.effectiveImageLimits.maxImageBytes)}/image, ${formatMib(this.effectiveImageLimits.maxBatchBytes)}/batch, ${this.effectiveImageLimits.maxImagePixels.toLocaleString("en-US")} pixels/image`,
@@ -636,7 +690,7 @@ export class WebUIRuntime {
 			"",
 			`Write this unit to ~/.config/systemd/user/${HUB_UNIT_NAME}:`,
 			"",
-			renderHubUnit({ allowedHosts: allowedHostsFromEnv() }),
+			renderHubUnit(),
 			"Then run:",
 			...hubInstallSteps().map((step) => `  ${step}`),
 			"",
@@ -1037,12 +1091,12 @@ function formatMib(bytes: number): string {
 	return `${bytes / (1024 * 1024)} MiB`;
 }
 
-/** Extra `Host` names this machine already trusts, so the printed unit matches the environment. */
-function allowedHostsFromEnv(): string[] {
-	return (process.env.PI_WEBUI_ALLOWED_HOSTS ?? "")
-		.split(",")
-		.map((host) => host.trim())
-		.filter(Boolean);
+
+function hubSettingsLine(): string {
+	const read: HubConfigRead = readHubConfig();
+	const port = read.portFromFile ? `${read.config.port} (${CONFIG_FILE_NAME})` : `${read.config.port} (default)`;
+	const extras = read.config.allowedHosts.length;
+	return `port ${port}, ${extras} allowed host name${extras === 1 ? "" : "s"} from ${safeTerminalText(read.path)}`;
 }
 
 function hubStatusLine(status: HubClientStatus): string {

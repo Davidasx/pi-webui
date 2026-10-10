@@ -3,6 +3,7 @@ import { lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promi
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import lockfile from "proper-lockfile";
+import { CONFIG_FILE_NAME, DEFAULT_HUB_PORT } from "./hub-protocol.js";
 import {
 	DEFAULT_IMAGE_LIMITS,
 	IMAGE_HARD_LIMITS,
@@ -10,7 +11,8 @@ import {
 	imageLimits,
 } from "./image-limits.js";
 
-export const SETTINGS_FILE = "pi-webui.json";
+/** The configuration file name is owned by the shared contract; both readers resolve it the same way. */
+export const SETTINGS_FILE = CONFIG_FILE_NAME;
 
 const MIB = 1024 * 1024;
 
@@ -19,6 +21,10 @@ export interface WebUISettings extends ImageLimits {
 	retainSentImages: boolean;
 	maxRetainedImages: number;
 	maxRetainedBytes: number;
+	/** Hub listen port, written to the `hub` object of the same file. */
+	hubPort: number;
+	/** Extra allowed `Host` names (a tunnel or reverse proxy in front of the hub). */
+	hubAllowedHosts: string[];
 }
 
 export const DEFAULT_SETTINGS: Readonly<WebUISettings> = Object.freeze({
@@ -26,6 +32,8 @@ export const DEFAULT_SETTINGS: Readonly<WebUISettings> = Object.freeze({
 	retainSentImages: false,
 	maxRetainedImages: 32,
 	maxRetainedBytes: 128 * MIB,
+	hubPort: DEFAULT_HUB_PORT,
+	hubAllowedHosts: [],
 	...DEFAULT_IMAGE_LIMITS,
 });
 
@@ -101,6 +109,22 @@ export function normalizeSettings(value: unknown): WebUISettings | undefined {
 			return undefined;
 		}
 	}
+	const hub = value.hub;
+	if (hub !== undefined && !isRecord(hub)) return undefined;
+	const hubPort = isRecord(hub) && Object.hasOwn(hub, "port") ? hub.port : undefined;
+	if (
+		hubPort !== undefined &&
+		(typeof hubPort !== "number" || !Number.isSafeInteger(hubPort) || hubPort < 1 || hubPort > 65_535)
+	) {
+		return undefined;
+	}
+	const hubAllowedHosts = isRecord(hub) && Object.hasOwn(hub, "allowedHosts") ? hub.allowedHosts : undefined;
+	if (
+		hubAllowedHosts !== undefined &&
+		(!Array.isArray(hubAllowedHosts) || hubAllowedHosts.some((host) => typeof host !== "string" || !host.trim()))
+	) {
+		return undefined;
+	}
 	const normalized = {
 		startOnSessionStart:
 			typeof value.startOnSessionStart === "boolean"
@@ -133,6 +157,10 @@ export function normalizeSettings(value: unknown): WebUISettings | undefined {
 					? value.maxImagePixels
 					: DEFAULT_SETTINGS.maxImagePixels,
 		}),
+		hubPort: typeof hubPort === "number" ? hubPort : DEFAULT_SETTINGS.hubPort,
+		hubAllowedHosts: Array.isArray(hubAllowedHosts)
+			? hubAllowedHosts.map((host) => (host as string).trim().toLowerCase())
+			: [...DEFAULT_SETTINGS.hubAllowedHosts],
 	};
 	if (normalized.maxImageBytes > normalized.maxBatchBytes) return undefined;
 	return normalized;
@@ -177,6 +205,32 @@ export async function loadSettings(path = settingsFilePath()): Promise<SettingsL
 	}
 }
 
+/** Normalized settings as they are stored: hub fields live under a nested `hub` object. */
+export function settingsDocument(settings: WebUISettings): Record<string, unknown> {
+	const { hubPort, hubAllowedHosts, ...rest } = settings;
+	return {
+		...rest,
+		hub: { port: hubPort, ...(hubAllowedHosts.length > 0 ? { allowedHosts: hubAllowedHosts } : {}) },
+	};
+}
+
+/** Apply a settings patch to an existing document without flattening or dropping the `hub` object. */
+function mergeSettingsDocument(
+	document: Record<string, unknown>,
+	patch: Partial<WebUISettings>,
+): Record<string, unknown> {
+	const { hubPort, hubAllowedHosts, ...rest } = patch;
+	const hub = isRecord(document.hub) ? document.hub : {};
+	const hubPatch = {
+		...(hubPort !== undefined ? { port: hubPort } : {}),
+		...(hubAllowedHosts !== undefined ? { allowedHosts: hubAllowedHosts } : {}),
+	};
+	return {
+		...document,
+		...rest,
+		...(Object.keys(hubPatch).length > 0 ? { hub: { ...hub, ...hubPatch } } : {}),
+	};
+}
 export async function saveSettings(
 	settings: Partial<WebUISettings>,
 	_document: Record<string, unknown>,
@@ -190,7 +244,7 @@ export async function saveSettings(
 		if (latest.kind === "invalid") {
 			throw new Error(`Cannot save pi-webui settings until the existing file is repaired.`);
 		}
-		const nextDocument = { ...latest.document, ...settings };
+		const nextDocument = mergeSettingsDocument(latest.document ?? {}, settings);
 		if (!normalizeSettings(nextDocument)) {
 			throw new Error("Cannot save invalid pi-webui settings.");
 		}
@@ -228,7 +282,7 @@ export async function initializeSettings(
 		try {
 			await (operations.write ?? DEFAULT_FILE_OPERATIONS.write)(
 				temporaryPath,
-				`${JSON.stringify(DEFAULT_SETTINGS, null, 2)}\n`,
+				`${JSON.stringify(settingsDocument(DEFAULT_SETTINGS), null, 2)}\n`,
 			);
 			throwIfCompromised();
 			if (await pathEntryExists(path)) return "exists";

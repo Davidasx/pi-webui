@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "vitest";
 import { HubClient } from "../src/hub-client.js";
 import { DEFAULT_HUB_PORT, HEARTBEAT_PATH, hubBaseUrl, hubSessionUrl, REGISTER_PATH } from "../src/hub-protocol.js";
@@ -8,13 +11,16 @@ const METADATA = { sessionId: "session-1", port: 1234, projectName: "demo", acti
 const TOKEN = "e".repeat(40);
 const HUB_URL = "http://127.0.0.1:43118/";
 
-test("hub urls come from the environment with a fixed default port", () => {
-	assert.equal(hubBaseUrl({}), `http://127.0.0.1:${DEFAULT_HUB_PORT}/`);
-	assert.equal(hubBaseUrl({ PI_WEBUI_PORT: "9000" }), "http://127.0.0.1:9000/");
-	assert.equal(hubBaseUrl({ PI_WEBUI_PORT: "not-a-port" }), `http://127.0.0.1:${DEFAULT_HUB_PORT}/`);
-	assert.equal(hubBaseUrl({ PI_WEBUI_HUB_URL: "http://127.0.0.1:7777/some/path" }), "http://127.0.0.1:7777/");
-	assert.equal(hubBaseUrl({ PI_WEBUI_HUB_URL: "://broken", PI_WEBUI_PORT: "8123" }), "http://127.0.0.1:8123/");
-	assert.equal(hubSessionUrl(HUB_URL, "abc"), "http://127.0.0.1:43118/s/abc/");
+test("hub urls come from the configuration file, with the default as fallback", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-webui-client-config-"));
+	try {
+		writeFileSync(join(dir, "pi-webui.json"), JSON.stringify({ hub: { port: 9_000 } }));
+		assert.equal(hubBaseUrl({ env: { PI_CODING_AGENT_DIR: dir } }), "http://127.0.0.1:9000/");
+		assert.equal(hubBaseUrl({ env: { PI_CODING_AGENT_DIR: join(dir, "absent") } }), `http://127.0.0.1:${DEFAULT_HUB_PORT}/`);
+		assert.equal(hubSessionUrl("http://127.0.0.1:9000/", "abc"), "http://127.0.0.1:9000/s/abc/");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("client registers, publishes a session url, and keeps the registration alive", async () => {

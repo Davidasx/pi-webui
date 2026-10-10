@@ -91,9 +91,8 @@ Type=simple
 ExecStart=/usr/bin/env node /path/to/pi-webui/bin/pi-webui-hub.mjs
 Restart=on-failure
 RestartSec=2
-Environment=PI_WEBUI_PORT=43118
-# Extra Host header names, needed only when a tunnel or reverse proxy fronts the hub.
-Environment=PI_WEBUI_ALLOWED_HOSTS=pi.example.com
+# Port, bind address, and allowed host names live in ~/.pi/agent/pi-webui.json:
+#   { "hub": { "port": 43118, "allowedHosts": ["pi.example.com"] } }
 NoNewPrivileges=true
 PrivateTmp=true
 
@@ -140,7 +139,7 @@ ephemeral port, so the extension stays useful without the service.
 - **No authentication, by design.** Any local process can drive a registered session through the
   hub, so treat the port as equivalent to typing in the terminal. Keep it on loopback.
 - **Host validation.** The hub answers only for `127.0.0.1`, `localhost`, `::1`, plus any hostname
-  in `PI_WEBUI_ALLOWED_HOSTS`. Anything else gets `421`, which also blocks DNS-rebinding attempts.
+  in `hub.allowedHosts`. Anything else gets `421`, which also blocks DNS-rebinding attempts.
 - **Origin validation.** Session-scoped mutations must arrive with the session's own origin; the hub
   restates a validated browser origin as the session origin when it proxies, so a page on another
   origin (including a hostile web page in your browser) is refused with `403`.
@@ -150,20 +149,16 @@ ephemeral port, so the extension stays useful without the service.
   nonce-based policy (no CDN, no remote service, no browser storage).
 - **Remote access is yours to add.** Front the hub with a tunnel or reverse proxy that does
   authentication (Cloudflare Zero Trust, an SSH tunnel, mTLS, …) and add its hostname to
-  `PI_WEBUI_ALLOWED_HOSTS`. pi-webui will not grow its own auth.
+  `hub.allowedHosts` in the configuration file. pi-webui will not grow its own auth.
 
 ## Configuration
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `PI_WEBUI_PORT` | `43118` | Fixed hub port (set it in the unit) |
-| `PI_WEBUI_HOST` | `127.0.0.1` | Hub bind address |
-| `PI_WEBUI_ALLOWED_HOSTS` | — | Comma-separated extra `Host` names (proxy/tunnel) |
-| `PI_WEBUI_HUB_URL` | derived from `PI_WEBUI_PORT` | Full hub base URL for the extension |
-| `PI_WEBUI_HUB_QUIET` | — | `1` reduces hub logging |
+There are **no `pi-webui` environment variables**. One file is the single source of truth for both
+readers — the hub service and the extension:
 
-Extension settings live in one global file, `<getAgentDir()>/pi-webui.json`
-(`~/.pi/agent/pi-webui.json`):
+```text
+$PI_CODING_AGENT_DIR/pi-webui.json      # else ~/.pi/agent/pi-webui.json
+```
 
 ```json
 {
@@ -172,13 +167,42 @@ Extension settings live in one global file, `<getAgentDir()>/pi-webui.json`
   "maxImages": 8,
   "maxImageBytes": 10485760,
   "maxBatchBytes": 41943040,
-  "maxImagePixels": 50000000
+  "maxImagePixels": 50000000,
+  "hub": {
+    "port": 43118,
+    "allowedHosts": ["pi.example.com"]
+  }
 }
 ```
 
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `hub.port` | `43118` | Port the hub service listens on and the extension connects to |
+| `hub.allowedHosts` | loopback only | Extra `Host` names to answer for (a tunnel or reverse proxy) |
+| `startOnSessionStart` | `false` | Publish this session automatically on every session start |
+
+The hub binds `127.0.0.1` and only `127.0.0.1`; exposing it is the tunnel's job, not a setting. Both
+processes read this file the same way, so changing `hub.port` needs no systemd edit and no
+`daemon-reload` — write the file and restart the service:
+
+```bash
+systemctl --user restart pi-webui-hub.service
+```
+
+Running sessions follow a port change on their own: the extension re-reads the file after a failed
+heartbeat. `/webui status` prints the effective port, where it came from, and the file path;
+`/webui settings` edits the port in place.
+
+For debugging, the hub also accepts `--port <port>` and `--host <host>` flags that override the file
+for that one run. The extension always reads the file, so a temporary `--port` is only useful with
+the direct URL the hub prints on startup.
+
 `startOnSessionStart` publishes the session automatically on every session start (startup, reload,
-new, resume, fork) instead of waiting for `/webui open`. Malformed JSON is preserved, ignored with a
-warning, and never rewritten; `/webui status` reports the effective values and their source.
+new, resume, fork) instead of waiting for `/webui open`. Malformed JSON, or a `hub` value with the
+wrong type, is preserved and ignored with a warning; `/webui status` reports the effective values and
+the file path. The extension validates strictly before writing (an invalid recognized value sends the
+menu to the repair flow), while the hub reports the problem in its log and starts with the default
+port instead of refusing to run.
 
 ## Protocol (for tooling)
 
@@ -212,6 +236,36 @@ Layout: `src/hub.ts` (router, run directly by Node through type stripping), `src
 (registration/heartbeat), `src/hub-protocol.ts` (shared contract), `src/server.ts` (in-session
 server), `src/runtime.ts` (Pi integration), `src/web/ui/*` (React client, bundled into
 `src/web/app.js`).
+
+## Behind a proxy or tunnel
+
+Server-sent events are what make the pages live, and Cloudflare's edge is not fully reliable with
+them: it has been observed to buffer `text/event-stream` (events arrive late, or only once the
+connection closes), and it drops a stream that stays idle for ~100 seconds. The hub and the client
+are built so that none of this makes a page go stale:
+
+- Idle streams emit a keep-alive comment every 15s (hub index, 15s for session streams too), which
+  keeps the path warm and below the idle cut-off. EventSource reconnects 2s after a cut.
+- The hub pushes a session snapshot every 3s even when nothing changed, so "quiet" and "dead" are
+  distinguishable from the browser side.
+- If the index stream goes silent for 8s, the landing page falls back to polling `/_hub/sessions`
+  every 3s and shows `polling` next to the port; it returns to `live` as soon as events flow again.
+- The session page does the same trick: when no stream data has arrived for 5s, it refreshes the
+  full snapshot over a plain request, so a buffered stream cannot freeze a running turn.
+
+If streaming still misbehaves through your tunnel, in order of what usually helps:
+
+1. Use a **named tunnel**, not a quick tunnel (`trycloudflare.com`): quick tunnels intentionally
+   buffer `GET` streams.
+2. Make sure the response is not compressed. The pages already send `Cache-Control: no-store` and
+   `X-Accel-Buffering: no`, but if you enabled Brotli/compression for the hostname, add a
+   Configuration Rule that turns compression off for it.
+3. Behind **Cloudflare Access**, the `CF_Authorization` cookie must reach the `/_hub/events` request —
+   it does in a normal browser session. If you front the hub with a service token or a header-only
+   policy instead, the page loads but its event stream will 403, and only the polling fallback keeps
+   it fresh.
+4. If a long-lived stream is a hard requirement, terminate TLS somewhere that streams honestly
+   (a plain reverse proxy, or a grey-clouded hostname for the hub only).
 
 ## Known behavior worth knowing
 

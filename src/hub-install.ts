@@ -9,17 +9,13 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_HUB_PORT, hubBaseUrl } from "./hub-protocol.js";
+import { CONFIG_FILE_NAME, configFilePath, hubBaseUrl } from "./hub-protocol.js";
 
 export const HUB_UNIT_NAME = "pi-webui-hub.service";
 
 export interface HubUnitOptions {
 	/** Extension root directory; defaults to this package (the parent of `src/`). */
 	root?: string;
-	/** Fixed listen port written into the unit. */
-	port?: number;
-	/** Extra `Host` header names, for a tunnel or reverse proxy in front of the hub. */
-	allowedHosts?: readonly string[];
 }
 
 /** Absolute path of this package's root directory. */
@@ -35,12 +31,6 @@ export function resolveExtensionRoot(): string {
  */
 export function renderHubUnit(options: HubUnitOptions = {}): string {
 	const root = options.root ?? resolveExtensionRoot();
-	const port = options.port ?? DEFAULT_HUB_PORT;
-	const allowedHosts = (options.allowedHosts ?? []).filter(Boolean).join(",");
-	const hostsLine = allowedHosts
-		? `# Extra Host header names, needed only when a tunnel or reverse proxy fronts the hub.
-Environment=PI_WEBUI_ALLOWED_HOSTS=${allowedHosts}`
-		: "# Environment=PI_WEBUI_ALLOWED_HOSTS=pi.example.com";
 	return `[Unit]
 Description=pi-webui hub — fixed-port router for Pi session browser views
 After=default.target
@@ -51,10 +41,9 @@ ExecStart=/usr/bin/env node ${root}/bin/pi-webui-hub.mjs
 Restart=on-failure
 RestartSec=2
 
-# Fixed listen port. Every Pi session publishes itself here; the hub only routes requests.
-Environment=PI_WEBUI_PORT=${port}
-${hostsLine}
-
+# Port, bind address, and allowed host names live in ${configFilePath()}:
+#   { "hub": { "port": 43118, "allowedHosts": ["pi.example.com"] } }
+# Change that file and run: systemctl --user restart ${HUB_UNIT_NAME}
 NoNewPrivileges=true
 PrivateTmp=true
 
@@ -64,15 +53,15 @@ WantedBy=default.target
 }
 
 /** Commands to install and start the hub as a user service. */
-export function hubInstallSteps(options: HubUnitOptions = {}): string[] {
-	const port = options.port ?? DEFAULT_HUB_PORT;
+export function hubInstallSteps(): string[] {
 	return [
 		"mkdir -p ~/.config/systemd/user",
 		`write the unit below to ~/.config/systemd/user/${HUB_UNIT_NAME}`,
 		"systemctl --user daemon-reload",
 		`systemctl --user enable --now ${HUB_UNIT_NAME}`,
 		`systemctl --user status ${HUB_UNIT_NAME}`,
-		`open ${hubBaseUrl({ PI_WEBUI_PORT: String(port) } as NodeJS.ProcessEnv)}`,
+		`open ${hubBaseUrl()}`,
+		`# after editing ${CONFIG_FILE_NAME}: systemctl --user restart ${HUB_UNIT_NAME}`,
 	];
 }
 

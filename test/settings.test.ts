@@ -3,6 +3,7 @@ import { lstat, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promise
 import os from "node:os";
 import path from "node:path";
 import { test } from "vitest";
+import { DEFAULT_HUB_PORT } from "../src/hub-protocol.js";
 import { DEFAULT_IMAGE_LIMITS, IMAGE_HARD_LIMITS } from "../src/image-limits.js";
 import {
 	DEFAULT_SETTINGS,
@@ -12,6 +13,7 @@ import {
 	RETENTION_HARD_LIMITS,
 	type SettingsFileOperations,
 	saveSettings,
+	settingsDocument,
 } from "../src/settings.js";
 
 test("sent-image retention uses conservative opt-in defaults and finite hard ceilings", () => {
@@ -132,6 +134,7 @@ test("saving is atomic and preserves unknown fields", async () => {
 			maxImageBytes: 10 * 1024 * 1024,
 			maxBatchBytes: 40 * 1024 * 1024,
 			maxImagePixels: 50_000_000,
+			hub: { port: DEFAULT_HUB_PORT, allowedHosts: [] },
 		});
 	} finally {
 		await rm(directory, { recursive: true, force: true });
@@ -225,7 +228,7 @@ test("init creates formatted defaults once and never overwrites existing content
 		assert.equal(await initializeSettings(settingsPath), "created");
 		assert.equal(
 			await readFile(settingsPath, "utf8"),
-			`${JSON.stringify(DEFAULT_SETTINGS, null, 2)}\n`,
+			`${JSON.stringify(settingsDocument(DEFAULT_SETTINGS), null, 2)}\n`,
 		);
 		await writeFile(settingsPath, "{invalid but owned}\n");
 		assert.equal(await initializeSettings(settingsPath), "exists");
@@ -309,7 +312,7 @@ test("init renames one complete temporary while holding the settings mutation lo
 					assert.equal(locked, true);
 					assert.equal(
 						await readFile(source, "utf8"),
-						`${JSON.stringify(DEFAULT_SETTINGS, null, 2)}\n`,
+						`${JSON.stringify(settingsDocument(DEFAULT_SETTINGS), null, 2)}\n`,
 					);
 					publicationObserved = true;
 					await rename(source, destination);
@@ -362,7 +365,7 @@ test("concurrent init calls publish one complete default document", async () => 
 		);
 		assert.equal(
 			await readFile(settingsPath, "utf8"),
-			`${JSON.stringify(DEFAULT_SETTINGS, null, 2)}\n`,
+			`${JSON.stringify(settingsDocument(DEFAULT_SETTINGS), null, 2)}\n`,
 		);
 		assert.deepEqual(await import("node:fs/promises").then(({ readdir }) => readdir(directory)), [
 			"pi-webui.json",

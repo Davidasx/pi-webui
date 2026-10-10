@@ -960,6 +960,33 @@ test("effective image limits drive public state, admission, upload, and batch me
 	}
 });
 
+test("idle event streams send keep-alive comments so proxies do not cut them", async () => {
+	const conversation = new ConversationProjection({ id: "s", cwd: "/w", projectName: "w" });
+	const server = await WebUIServer.start({
+		conversation,
+		send: async () => ({ delivery: "immediate" }),
+		sseKeepAliveMs: 20,
+	});
+	try {
+		const response = await fetch(`${server.origin}/api/events?since=0`);
+		assert.equal(response.status, 200);
+		const reader = response.body?.getReader();
+		assert.ok(reader);
+		const decoder = new TextDecoder();
+		let text = decoder.decode((await reader.read()).value);
+		for (let attempt = 0; attempt < 60 && !text.includes(": ping"); attempt += 1) {
+			const chunk = await reader.read();
+			if (chunk.done) break;
+			text += decoder.decode(chunk.value, { stream: true });
+		}
+		assert.match(text, /retry: 2000/);
+		assert.match(text, /: ping/);
+		await reader.cancel().catch(() => undefined);
+	} finally {
+		await server.close();
+	}
+});
+
 test("empty SSE streams flush immediately and remain available for later events", async () => {
 	const { conversation, server } = await harness();
 	try {
