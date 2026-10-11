@@ -1,27 +1,11 @@
-import { createHash, } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { Socket } from "node:net";
-import {
-	AttachmentError,
-	type AttachmentLimits,
-	AttachmentStore,
-	type PreparedAttachment,
-	type PublicAttachmentState,
-} from "./attachments.js";
-import type { ConversationEvent, ConversationProjection } from "./conversation.js";
-import { DraftError, DraftStore, type PublicDraftState } from "./drafts.js";
 import { HUB_NAME } from "./hub-protocol.js";
-import { type ImageLimits, imageLimits, PROVIDER_IMAGE_LIMITS } from "./image-limits.js";
-import type { BrowserImageInput } from "./images.js";
-import { SentImageError, type SentImageSettings, SentImageStore } from "./sent-images.js";
+import { serveVendoredRoute } from "./vendored-routes.js";
 
 const JSON_LIMIT = 64 * 1024 * 1024;
-const CLIENT_ID = /^[A-Za-z0-9_-]{1,80}$/;
-const REQUEST_ID = /^[A-Za-z0-9_-]{1,120}$/;
-const MAX_REQUESTS = 128;
-const DEFAULT_MAX_DRAFT_TEXT_BYTES = 1024 * 1024;
-const DEFAULT_SSE_KEEP_ALIVE_MS = 15_000;
-const SSE_FLUSH_TIMEOUT_MS = 250;
+/** Longest wait for a response to finish flushing before its socket is let go. */
+const _RESPONSE_FLUSH_TIMEOUT_MS = 250;
 /** Set by the hub on every tunneled request, after it validated Host and Origin itself. */
 const HUB_VIA_HEADER = "x-pi-webui-via";
 const HUB_ORIGIN_HEADER = "x-pi-webui-origin";
@@ -71,25 +55,26 @@ export interface WebUIIdentity {
 	server?: Server;
 }
 
-export interface WebSendRequest {
-	requestId: string;
-	text: string;
-	attachmentRevision?: number;
-	attachmentIds?: string[];
-	images: BrowserImageInput[];
-	retainedImageIds?: string[];
-	delivery: "next" | "steer";
-	signal?: AbortSignal;
-}
-
-interface ParsedSendRequest {
-	requestId: string;
-	draftRevision: number;
-	delivery: "next" | "steer";
-}
-
-export interface WebSendResult {
-	delivery: "immediate" | "followUp" | "steer" | "command";
+/**
+ * agegr/pi-web's frontend contract, answered by this session.
+ *
+ * Their page is a view over these calls, so serving them is what lets their components run here
+ * unchanged instead of being re-drawn.
+ */
+export interface WebUIPiWebBridge {
+	/** Pi's session id, which their `connected` frame echoes back. */
+	sessionId(): string;
+	/**
+	 * Their "generate title": name this session after what it is about. Their own generator writes
+	 * an LLM title through Pi's internal `Agent`, which an extension cannot reach, so this names it
+	 * from the session's first user message — the name their sidebar would otherwise show anyway.
+	 */
+	autoName(id: string): Promise<{ title: string; usage?: unknown } | undefined>;
+	command(command: Record<string, unknown>): Promise<unknown>;
+	state(): Promise<unknown>;
+	/** Live agent events, already in their wire shape; returns an unsubscribe function. */
+	subscribe(listener: (event: unknown) => void): () => void;
+	isRunning(): boolean;
 }
 
 /** What the top bar needs from the session: Pi's own controls, not the web layer's. */
@@ -102,27 +87,11 @@ export interface WebUISessionControls {
 }
 
 export interface WebUIServerOptions {
-	conversation: ConversationProjection;
-	send: (request: WebSendRequest) => Promise<WebSendResult>;
+	/** Their frontend's contract, answered by this session. */
+	piWeb?: WebUIPiWebBridge;
+	/** Pi's own controls, which the session screen shows when this bridge is absent. */
 	controls?: WebUISessionControls;
-	processAttachment?: (source: Uint8Array, signal?: AbortSignal) => Promise<PreparedAttachment>;
-	attachmentLimits?: AttachmentLimits;
-	imageLimits?: Readonly<ImageLimits>;
-	sentImageSettings?: SentImageSettings;
-	maxDraftTextBytes?: number;
 	maxRequestBytes?: number;
-	/** How often an idle event stream sends a comment, so proxies do not cut a quiet connection. */
-	sseKeepAliveMs?: number;
-}
-
-interface SseClient {
-	response: WebServerResponse;
-}
-
-interface RequestRecord {
-	hash: string;
-	promise: Promise<WebSendResult>;
-	settled: boolean;
 }
 
 class HttpError extends Error {
@@ -143,21 +112,8 @@ export class WebUIServer {
 	private readonly browserOrigin: string;
 	private readonly server?: Server;
 	private readonly sockets = new Set<Socket>();
-	private readonly sseClients = new Set<SseClient>();
-	private readonly requests = new Map<string, RequestRecord>();
-	private readonly activeSendControllers = new Set<AbortController>();
-	private readonly activeAttachmentControllers = new Set<AbortController>();
-	private readonly attachments: AttachmentStore;
-	private readonly attachmentLimits: AttachmentLimits;
-	private readonly imageLimits: Readonly<ImageLimits>;
-	private readonly draft: DraftStore;
-	private readonly sentImages: SentImageStore;
-	private readonly imageResidentBudget: number;
-	private activeClientId?: string;
-	private leaseGeneration = 0;
 	private closed = false;
 	private closePromise?: Promise<void>;
-	private readonly unsubscribe: () => void;
 
 	private constructor(
 		private readonly options: WebUIServerOptions,
@@ -167,56 +123,12 @@ export class WebUIServer {
 		this.browserOrigin = identity.origin;
 		this.port = identity.port ?? 0;
 		this.server = identity.server;
-		this.imageLimits = options.imageLimits
-			? imageLimits(options.imageLimits)
-			: imageLimits({
-					maxImages: options.attachmentLimits?.maxImages,
-					maxImageBytes: options.attachmentLimits?.maxImageBytes,
-					maxBatchBytes: options.attachmentLimits?.maxPromptBytes,
-				});
-		this.attachmentLimits = {
-			maxImages: this.imageLimits.maxImages,
-			maxImageBytes: this.imageLimits.maxImageBytes,
-			maxPromptBytes: this.imageLimits.maxBatchBytes,
-			maxPreparedImageBytes: PROVIDER_IMAGE_LIMITS.maxBase64Bytes,
-		};
-		this.draft = new DraftStore({
-			maxTextBytes: options.maxDraftTextBytes ?? DEFAULT_MAX_DRAFT_TEXT_BYTES,
-		});
-		const sentImageSettings = options.sentImageSettings ?? {
-			enabled: false,
-			maxImages: 32,
-			maxBytes: 128 * 1024 * 1024,
-		};
-		this.sentImages = new SentImageStore(sentImageSettings);
-		this.imageResidentBudget = Math.max(
-			sentImageSettings.maxBytes,
-			this.attachmentLimits.maxPromptBytes +
-				Math.max(
-					this.attachmentLimits.maxImageBytes,
-					this.attachmentLimits.maxPreparedImageBytes ?? 0,
-				) *
-					2,
-		);
-		this.attachments = new AttachmentStore({
-			limits: this.attachmentLimits,
-			process:
-				options.processAttachment ??
-				(async () => {
-					throw new Error("Image processing is unavailable.");
-				}),
-			onChange: (state) => {
-				this.reconcileSentImageBytes(state);
-				this.broadcastControl("attachments", state);
-			},
-		});
 		// Only the optional local listener owns sockets; over the channel there is nothing to track.
 		this.server?.on("connection", (socket) => {
 			this.sockets.add(socket);
 			socket.once("close", () => this.sockets.delete(socket));
 		});
 		this.server?.unref();
-		this.unsubscribe = options.conversation.subscribe((event) => this.broadcastEvent(event));
 	}
 
 	static async start(options: WebUIServerOptions): Promise<WebUIServer> {
@@ -266,19 +178,6 @@ export class WebUIServer {
 	private async closeNow(): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
-		this.unsubscribe();
-		for (const controller of this.activeSendControllers) controller.abort();
-		for (const controller of this.activeAttachmentControllers) controller.abort();
-		this.activeSendControllers.clear();
-		this.activeAttachmentControllers.clear();
-		this.attachments.close();
-		this.draft.close();
-		this.sentImages.close();
-		this.requests.clear();
-		const responses = [...this.sseClients].map((client) => client.response);
-		this.broadcastControl("session-ended", { message: "Pi session ended" });
-		await Promise.all(responses.map((response) => finishResponse(response)));
-		this.sseClients.clear();
 		this.server?.closeAllConnections?.();
 		for (const socket of this.sockets) socket.destroy();
 		if (this.server) await new Promise<void>((resolve) => this.server?.close(() => resolve()));
@@ -298,248 +197,58 @@ export class WebUIServer {
 				throw new HttpError(421, "Unexpected Host header");
 			}
 			const url = new URL(request.url ?? "/", this.browserOrigin);
-			if (request.method === "GET" && url.pathname === "/api/state") {
-				this.json(response, 200, {
-					...this.options.conversation.snapshot(),
-					lease: this.leaseSnapshot(),
-					draft: this.draft.publicState(),
-					attachments: this.attachments.publicState(),
-					imageLimits: this.imageLimits,
-					sentImages: this.sentImages.publicState(),
-				});
+			const payload = this.options.piWeb;
+			if (request.method === "GET" && /^\/api\/agent\/[^/]+\/state$/.test(url.pathname)) {
+				const state = payload ? await payload.state() : undefined;
+				this.json(response, 200, state ? { running: true, state } : { running: false });
 				return;
 			}
-			const sentPreviewId = sentImagePathId(url.pathname, "preview");
-			if (request.method === "GET" && sentPreviewId) {
-				const preview = this.sentImages.preview(sentPreviewId);
-				response.writeHead(200, {
-					"Content-Type": preview.mimeType,
-					"Content-Length": preview.bytes.byteLength,
-				});
-				response.end(preview.bytes);
+			if (request.method === "POST" && /^\/api\/agent\/[^/]+\/lease$/.test(url.pathname)) {
+				// Their lease renews the session's live event streams and reports how many it
+				// renewed; a 0 tells their client to reconnect the stream it thought it held. This
+				// server holds one stream per open browser tab, so that count is the honest answer.
+				this.json(response, 200, { success: true, renewed: this.piWebStreams > 0 ? 1 : 0 });
 				return;
 			}
-			const previewId = attachmentPathId(url.pathname, "preview");
-			if (request.method === "GET" && previewId) {
-				const preview = this.attachments.preview(previewId);
-				response.writeHead(200, {
-					"Content-Type": preview.mimeType,
-					"Content-Length": preview.bytes.byteLength,
-				});
-				response.end(preview.bytes);
+			// Their liveness/idle probe: a plain GET on the agent endpoint. It must answer 200 with
+			// the live state, because their client treats any other status as "the session is gone"
+			// and retries in a loop while the composer waits.
+			if (request.method === "GET" && /^\/api\/agent\/[^/]+$/.test(url.pathname)) {
+				const state = payload ? await payload.state() : undefined;
+				this.json(response, 200, { running: state !== undefined, ...(state ? { state } : {}) });
 				return;
 			}
-			if (request.method === "GET" && url.pathname === "/api/events") {
-				this.events(url, request, response);
+			// Their title button. Their own route is copied too, but it reaches for the live
+			// `AgentSession` internals; this answers with the name their sidebar itself derives.
+			if (request.method === "POST" && /^\/api\/sessions\/[^/]+\/auto-name$/.test(url.pathname)) {
+				this.assertMutation(request);
+				const named = await payload?.autoName(decodeURIComponent(url.pathname.split("/")[3] ?? ""));
+				if (!named) throw new HttpError(404, "Session not found");
+				this.json(response, 200, { title: named.title, usage: named.usage ?? null });
 				return;
 			}
-			if (request.method === "GET" && url.pathname === "/api/controls/models") {
-				this.json(response, 200, { models: (await this.options.controls?.models()) ?? [] });
+			if (request.method === "GET" && /^\/api\/agent\/[^/]+\/events$/.test(url.pathname)) {
+				this.piWebEvents(request, response);
 				return;
 			}
-			this.assertMutation(request);
-			if (request.method === "POST" && url.pathname === "/api/lease") {
-				const body = await readJson(request, 8 * 1024);
-				if (!isRecord(body)) throw new HttpError(400, "Invalid lease request");
-				const clientId = stringField(body, "clientId");
-				if (!CLIENT_ID.test(clientId) || request.headers["x-pi-web-client"] !== clientId) {
-					throw new HttpError(400, "Invalid client id");
-				}
-				this.activeClientId = clientId;
-				this.leaseGeneration += 1;
-				for (const controller of this.activeSendControllers) controller.abort();
-				for (const controller of this.activeAttachmentControllers) controller.abort();
-				this.attachments.cancelInFlight("Editing moved to another browser tab.");
-				this.broadcastControl("lease", {
-					activeClientId: clientId,
-					generation: this.leaseGeneration,
-				});
-				this.json(response, 200, {
-					activeClientId: clientId,
-					generation: this.leaseGeneration,
-				});
+			if (request.method === "POST" && url.pathname === "/api/agent/new") {
+				throw new HttpError(501, "Starting sessions from the browser is not supported here.");
+			}
+			if (request.method === "POST" && /^\/api\/agent\/[^/]+$/.test(url.pathname)) {
+				this.assertMutation(request);
+				if (!payload) throw new HttpError(503, "This session is not available");
+				const command = await readJson(request, JSON_LIMIT);
+				if (!isRecord(command)) throw new HttpError(400, "Invalid command");
+				this.json(response, 200, { success: true, data: await payload.command(command) });
 				return;
 			}
-			const lease = this.assertActiveClient(request);
-			if (request.method === "POST" && url.pathname === "/api/controls/model") {
-				this.assertLease(lease);
-				const body = await readJson(request, 8 * 1024);
-				if (!isRecord(body)) throw new HttpError(400, "Invalid model request");
-				const controls = this.requireControls();
-				await controls.setModel(stringField(body, "provider"), stringField(body, "id"));
-				this.json(response, 200, { ok: true });
-				return;
-			}
-			if (request.method === "POST" && url.pathname === "/api/controls/thinking") {
-				this.assertLease(lease);
-				const body = await readJson(request, 8 * 1024);
-				if (!isRecord(body)) throw new HttpError(400, "Invalid thinking request");
-				const controls = this.requireControls();
-				await controls.setThinkingLevel(stringField(body, "level"));
-				this.json(response, 200, { ok: true });
-				return;
-			}
-			if (request.method === "POST" && url.pathname === "/api/controls/compact") {
-				this.assertLease(lease);
-				const controls = this.requireControls();
-				await controls.compact();
-				this.json(response, 200, { ok: true });
-				return;
-			}
-			if (request.method === "POST" && url.pathname === "/api/draft") {
-				const body = requireRecord(
-					await readJson(
-						request,
-						(this.options.maxDraftTextBytes ?? DEFAULT_MAX_DRAFT_TEXT_BYTES) + 8192,
-					),
-					"draft mutation",
-				);
-				this.assertLease(lease);
-				const state = this.draft.setText(
-					stringField(body, "text"),
-					numberField(body, "revision"),
-					stringField(body, "requestId"),
-				);
-				this.assertLease(lease);
-				this.broadcastDraft(state);
-				this.json(response, 200, state);
-				return;
-			}
-			if (request.method === "POST" && url.pathname === "/api/sent-images/reattach") {
-				const body = requireRecord(await readJson(request, 64 * 1024), "sent-image reattach");
-				this.assertLease(lease);
-				const items = parseSentImageReattachments(body.items);
-				const clones = this.sentImages.clone(items.map((item) => item.retainedId));
-				const attachments = this.attachments.attachPrepared(
-					clones.map((clone, index) => ({
-						id: items[index]?.id ?? "",
-						name: clone.name,
-						prepared: { bytes: clone.bytes, mimeType: clone.mimeType, notes: [] },
-					})),
-					numberField(body, "revision"),
-				);
-				this.assertLease(lease);
-				const draft = this.syncDraftAttachments(attachments);
-				this.json(response, 200, {
-					attachments,
-					draft,
-					sentImages: this.sentImages.publicState(),
-				});
-				return;
-			}
-			const sentDeleteId = sentImagePathId(url.pathname);
-			if (request.method === "DELETE" && sentDeleteId) {
-				const state = this.sentImages.remove(sentDeleteId, revisionParameter(url));
-				this.assertLease(lease);
-				this.broadcastSentImages(state);
-				this.json(response, 200, state);
-				return;
-			}
-			if (request.method === "POST" && url.pathname === "/api/sent-images/clear") {
-				const body = requireRecord(await readJson(request, 8 * 1024), "sent-image clear");
-				const state = this.sentImages.clear(numberField(body, "revision"));
-				this.assertLease(lease);
-				this.broadcastSentImages(state);
-				this.json(response, 200, state);
-				return;
-			}
-			if (request.method === "POST" && url.pathname === "/api/attachments/reserve") {
-				const body = requireRecord(await readJson(request, 64 * 1024), "attachment reservation");
-				this.assertLease(lease);
-				const state = this.attachments.reserve(
-					parseAttachmentReservations(body.items),
-					numberField(body, "revision"),
-				);
-				this.assertLease(lease);
-				this.syncDraftAttachments(state);
-				this.json(response, 201, state);
-				return;
-			}
-			const uploadId = attachmentPathId(url.pathname, "upload");
-			if (request.method === "POST" && uploadId) {
-				const revision = revisionParameter(url);
-				let source: Buffer;
-				try {
-					source = await readBytes(request, this.attachmentLimits.maxImageBytes);
-				} catch (error) {
-					this.assertLease(lease);
-					try {
-						this.attachments.failUpload(uploadId, `Upload failed: ${formatError(error)}`);
-					} catch (failure) {
-						if (!(failure instanceof AttachmentError) || failure.status !== 409) throw failure;
-					}
-					throw error;
-				}
-				this.assertLease(lease);
-				const state = await this.runAttachmentOperation(request, response, (signal) =>
-					this.attachments.upload(uploadId, source, revision, signal),
-				);
-				this.assertLease(lease);
-				this.json(response, 200, state);
-				return;
-			}
-			const retryId = attachmentPathId(url.pathname, "retry");
-			if (request.method === "POST" && retryId) {
-				const body = requireRecord(await readJson(request, 8 * 1024), "attachment retry");
-				this.assertLease(lease);
-				const state = await this.runAttachmentOperation(request, response, (signal) =>
-					this.attachments.retry(retryId, numberField(body, "revision"), signal),
-				);
-				this.assertLease(lease);
-				this.json(response, 200, state);
-				return;
-			}
-			const deleteId = attachmentPathId(url.pathname);
-			if (request.method === "DELETE" && deleteId) {
-				const state = this.attachments.remove(deleteId, revisionParameter(url));
-				this.assertLease(lease);
-				this.syncDraftAttachments(state);
-				this.json(response, 200, state);
-				return;
-			}
-			if (request.method === "POST" && url.pathname === "/api/attachments/reorder") {
-				const body = requireRecord(await readJson(request, 64 * 1024), "attachment reorder");
-				this.assertLease(lease);
-				const state = this.attachments.reorder(
-					stringArrayField(body, "ids"),
-					numberField(body, "revision"),
-				);
-				this.assertLease(lease);
-				this.syncDraftAttachments(state);
-				this.json(response, 200, state);
-				return;
-			}
-			if (request.method === "POST" && url.pathname === "/api/attachments/clear") {
-				const body = requireRecord(await readJson(request, 8 * 1024), "attachment clear");
-				this.assertLease(lease);
-				const state = this.attachments.clear(numberField(body, "revision"));
-				this.assertLease(lease);
-				this.syncDraftAttachments(state);
-				this.json(response, 200, state);
-				return;
-			}
-			if (request.method === "POST" && url.pathname === "/api/messages") {
-				const body = await readJson(request, this.options.maxRequestBytes ?? JSON_LIMIT);
-				this.assertLease(lease);
-				const message = parseSendRequest(body);
-				const result = await this.sendDeduplicated(message, request, response);
-				this.json(response, 202, {
-					accepted: true,
-					requestId: message.requestId,
-					...result,
-					draft: this.draft.publicState(),
-					attachments: this.attachments.publicState(),
-					sentImages: this.sentImages.publicState(),
-				});
-				return;
+			// files, git, skills, models, MCP, session reads and so on, run against this machine.
+			if ((request.method ?? "GET") !== "OPTIONS" && url.pathname.startsWith("/api/")) {
+				if (await serveVendoredRoute(request, response, this.origin)) return;
 			}
 			throw new HttpError(404, "Not found");
 		} catch (error) {
-			const expectedError =
-				error instanceof HttpError ||
-				error instanceof AttachmentError ||
-				error instanceof DraftError ||
-				error instanceof SentImageError;
+			const expectedError = error instanceof HttpError;
 			const status = expectedError ? error.status : 500;
 			const message = expectedError ? error.message : "Internal server error";
 			if (error instanceof HttpError && error.closeConnection)
@@ -550,282 +259,73 @@ export class WebUIServer {
 	}
 
 
-	private requireControls(): WebUISessionControls {
-		const controls = this.options.controls;
-		if (!controls) throw new HttpError(503, "This session does not expose its controls");
-		return controls;
-	}
 
 	private assertMutation(request: WebServerRequest): void {
 		// Behind the hub, the browser's origin is whatever host the operator uses (a tunnel hostname),
 		// so accept the origin the hub already checked against its own Host header.
+		const origin = request.headers.origin;
+		if (origin === undefined && isHubRequest(request)) return;
 		const viaHub = isHubRequest(request) ? request.headers[HUB_ORIGIN_HEADER] : undefined;
 		const expected = typeof viaHub === "string" ? viaHub : this.browserOrigin;
-		if (request.headers.origin !== expected) throw new HttpError(403, "Unexpected Origin");
+		if (origin !== expected) throw new HttpError(403, "Unexpected Origin");
 	}
 
-	private assertActiveClient(request: WebServerRequest): { clientId: string; generation: number } {
-		const clientId = request.headers["x-pi-web-client"];
-		if (typeof clientId !== "string" || clientId !== this.activeClientId) {
-			throw new HttpError(409, "This browser tab is stale");
-		}
-		return { clientId, generation: this.leaseGeneration };
-	}
 
-	private assertLease(lease: { clientId: string; generation: number }): void {
-		if (lease.clientId !== this.activeClientId || lease.generation !== this.leaseGeneration) {
-			throw new HttpError(409, "This browser tab became stale");
-		}
-	}
 
-	private async runAttachmentOperation(
-		request: WebServerRequest,
-		response: WebServerResponse,
-		operation: (signal: AbortSignal) => PublicAttachmentState | Promise<PublicAttachmentState>,
-	): Promise<PublicAttachmentState> {
-		const controller = new AbortController();
-		this.activeAttachmentControllers.add(controller);
-		const abort = () => controller.abort();
-		request.once("aborted", abort);
-		response.once("close", abort);
-		try {
-			return await operation(controller.signal);
-		} finally {
-			request.off("aborted", abort);
-			response.off("close", abort);
-			this.activeAttachmentControllers.delete(controller);
-		}
-	}
 
-	private async sendDeduplicated(
-		message: ParsedSendRequest,
-		request: WebServerRequest,
-		response: WebServerResponse,
-	): Promise<WebSendResult> {
-		const hash = messageDigest(message);
-		const current = this.requests.get(message.requestId);
-		if (current) {
-			if (current.hash !== hash)
-				throw new HttpError(409, "Request id was reused with different content");
-			return current.promise;
-		}
-		const draftReservation = this.draft.beginSend(message.draftRevision);
-		const attachmentState = this.attachments.publicState();
-		if (
-			!sameIds(
-				draftReservation.attachmentIds,
-				attachmentState.items.map((item) => item.id),
-			)
-		) {
-			this.draft.finishSend(draftReservation.token, false);
-			throw new HttpError(409, "Draft attachment references are stale");
-		}
-		let attachmentReservation: ReturnType<AttachmentStore["beginSend"]> | undefined;
-		try {
-			attachmentReservation =
-				draftReservation.attachmentIds.length > 0
-					? this.attachments.beginSend(draftReservation.attachmentIds, attachmentState.revision)
-					: undefined;
-		} catch (error) {
-			this.draft.finishSend(draftReservation.token, false);
-			throw error;
-		}
-		const retainedImageIds = this.sentImages.referencesFor(
-			message.requestId,
-			attachmentReservation?.images ?? [],
-		);
-		const controller = new AbortController();
-		this.activeSendControllers.add(controller);
-		const abort = () => controller.abort();
-		request.once("aborted", abort);
-		response.once("close", abort);
-		let reservationsSettled = false;
-		const promise = this.options
-			.send({
-				requestId: message.requestId,
-				text: draftReservation.text,
-				attachmentRevision: attachmentState.revision,
-				attachmentIds: draftReservation.attachmentIds,
-				images: attachmentReservation?.images ?? [],
-				retainedImageIds,
-				delivery: message.delivery,
-				signal: controller.signal,
-			})
-			.then((result) => {
-				if (retainedImageIds.length > 0) {
-					try {
-						const before = this.sentImages.publicState().revision;
-						this.sentImages.commit(
-							message.requestId,
-							attachmentReservation?.images ?? [],
-							retainedImageIds,
-						);
-						const retained = this.sentImages.reconcile(
-							attachmentState.totalResidentBytes,
-							this.imageResidentBudget,
-						);
-						if (retained.revision !== before) this.broadcastSentImages(retained);
-					} catch {
-						// Retention is optional and must not turn an accepted Pi message into a failure.
-					}
-				}
-				const nextAttachments = attachmentReservation
-					? this.attachments.finishSend(attachmentReservation.token, true)
-					: this.attachments.publicState();
-				const nextDraft = this.draft.finishSend(draftReservation.token, true, {
-					revision: nextAttachments.revision,
-					ids: nextAttachments.items.map((item) => item.id),
-				});
-				this.broadcastDraft(nextDraft);
-				reservationsSettled = true;
-				const record = this.requests.get(message.requestId);
-				if (record?.promise === promise) {
-					record.settled = true;
-					this.trimRequests();
-				}
-				return result;
-			})
-			.catch((error) => {
-				if (!reservationsSettled) {
-					try {
-						if (attachmentReservation) {
-							this.attachments.finishSend(attachmentReservation.token, false);
-						}
-						this.draft.finishSend(draftReservation.token, false);
-					} catch {
-						// Session shutdown may already have released the reservations.
-					}
-					reservationsSettled = true;
-				}
-				if (this.requests.get(message.requestId)?.promise === promise) {
-					this.requests.delete(message.requestId);
-				}
-				if (controller.signal.aborted) throw new HttpError(409, "Browser send was cancelled");
-				throw error;
-			})
-			.finally(() => {
-				request.off("aborted", abort);
-				response.off("close", abort);
-				this.activeSendControllers.delete(controller);
-			});
-		this.requests.set(message.requestId, { hash, promise, settled: false });
-		this.trimRequests();
-		return promise;
-	}
+	/** Their event stream: `data:` frames of agent events, with comment heartbeats. */
+	private piWebStreams = 0;
 
-	private trimRequests(): void {
-		if (this.requests.size <= MAX_REQUESTS) return;
-		for (const [requestId, record] of this.requests) {
-			if (!record.settled) continue;
-			this.requests.delete(requestId);
-			if (this.requests.size <= MAX_REQUESTS) return;
-		}
-	}
-
-	private events(url: URL, request: WebServerRequest, response: WebServerResponse): void {
-		const sinceText = url.searchParams.get("since") ?? "0";
-		if (!/^\d+$/.test(sinceText)) throw new HttpError(400, "Invalid event cursor");
-		const since = Number(sinceText);
-		if (!Number.isSafeInteger(since)) throw new HttpError(400, "Invalid event cursor");
+	private piWebEvents(request: WebServerRequest, response: WebServerResponse): void {
+		const payload = this.options.piWeb;
 		response.writeHead(200, {
 			"Content-Type": "text/event-stream; charset=utf-8",
+			"Cache-Control": "no-cache, no-transform",
 			Connection: "keep-alive",
-			"Cache-Control": "no-store",
 			"X-Accel-Buffering": "no",
 		});
 		response.flushHeaders();
-		const client: SseClient = { response };
-		this.sseClients.add(client);
-		// An idle stream must still emit bytes: proxies (Cloudflare among them) drop or buffer a
-		// connection that goes quiet, and the comment keeps the path warm without reaching the page.
-		const keepAlive = setInterval(() => {
-			if (!response.write(": ping\n\n")) {
-				clearInterval(keepAlive);
-				this.sseClients.delete(client);
-			}
-		}, this.options.sseKeepAliveMs ?? DEFAULT_SSE_KEEP_ALIVE_MS);
-		keepAlive.unref?.();
-		response.once("close", () => clearInterval(keepAlive));
-		response.write("retry: 2000\n\n");
-		if (!response.write(": connected\n\n")) {
-			this.sseClients.delete(client);
-			response.end();
-			return;
-		}
-		this.writeSse(client, "lease", this.leaseSnapshot());
-		this.writeSse(client, "draft", this.draft.publicState());
-		this.writeSse(client, "attachments", this.attachments.publicState());
-		this.writeSse(client, "image-limits", this.imageLimits);
-		this.writeSse(client, "sent-images", this.sentImages.publicState());
-		const replay = this.options.conversation.eventsAfter(since);
-		if (replay === undefined) {
-			this.writeSse(client, "snapshot", this.options.conversation.snapshot());
-		} else {
-			for (const event of replay) this.writeSse(client, "conversation", event);
-		}
-		request.once("close", () => this.sseClients.delete(client));
-	}
-
-	private leaseSnapshot(): { activeClientId?: string; generation: number } {
-		return {
-			...(this.activeClientId ? { activeClientId: this.activeClientId } : {}),
-			generation: this.leaseGeneration,
+		const write = (event: unknown) => {
+			const accepted = response.write(`data: ${JSON.stringify(event)}\n\n`);
+			if (!accepted) unsubscribe();
 		};
+		const unsubscribe = payload
+			? payload.subscribe((event) => write(event))
+			: () => undefined;
+		const heartbeat = setInterval(() => {
+			if (!response.write(":\n\n")) {
+				clearInterval(heartbeat);
+				unsubscribe();
+			}
+		}, 15_000);
+		heartbeat.unref?.();
+		this.piWebStreams += 1;
+		const release = () => {
+			this.piWebStreams = Math.max(0, this.piWebStreams - 1);
+			clearInterval(heartbeat);
+			unsubscribe();
+		};
+		request.once("close", release);
+		response.once("close", release);
+		// A comment byte flushes the headers without claiming the agent is ready, exactly as their
+		// stream does; the client keeps waiting for the `connected` data frame.
+		response.write(":\n\n");
+		write({
+			type: "connected",
+			sessionId: payload?.sessionId() ?? null,
+			isStreaming: payload?.isRunning() ?? false,
+			pendingExtensionUiIds: [],
+		});
 	}
 
-	private syncDraftAttachments(attachments: PublicAttachmentState): PublicDraftState {
-		const before = this.draft.publicState().revision;
-		const next = this.draft.syncAttachments(
-			attachments.items.map((item) => item.id),
-			attachments.revision,
-		);
-		if (next.revision !== before) this.broadcastDraft(next);
-		return next;
-	}
 
-	private broadcastDraft(state: PublicDraftState): void {
-		this.broadcastControl("draft", state);
-	}
 
-	private broadcastSentImages(state: ReturnType<SentImageStore["publicState"]>): void {
-		this.broadcastControl("sent-images", state);
-	}
 
-	private reconcileSentImageBytes(attachments = this.attachments.publicState()): void {
-		const processingReserve =
-			attachments.phase === "processing"
-				? Math.max(
-						this.attachmentLimits.maxImageBytes,
-						this.attachmentLimits.maxPreparedImageBytes ?? 0,
-					) * 2
-				: 0;
-		const before = this.sentImages.publicState().revision;
-		const retained = this.sentImages.reconcile(
-			attachments.totalResidentBytes + processingReserve,
-			this.imageResidentBudget,
-		);
-		if (retained.revision !== before) this.broadcastSentImages(retained);
-	}
 
-	private broadcastEvent(event: ConversationEvent): void {
-		for (const client of [...this.sseClients]) this.writeSse(client, "conversation", event);
-	}
 
-	private broadcastControl(event: string, payload: unknown): void {
-		for (const client of [...this.sseClients]) this.writeSse(client, event, payload);
-	}
 
-	private writeSse(client: SseClient, event: string, payload: unknown): void {
-		if (client.response.destroyed || client.response.writableEnded) {
-			this.sseClients.delete(client);
-			return;
-		}
-		const accepted = client.response.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
-		if (!accepted) {
-			this.sseClients.delete(client);
-			client.response.end();
-		}
-	}
+
+
 
 	/**
 	 * The page shell is served by the hub, so a session response is data only and carries no nonce.
@@ -853,63 +353,9 @@ export class WebUIServer {
 	}
 }
 
-function finishResponse(response: WebServerResponse): Promise<void> {
-	if (response.destroyed || response.writableFinished) return Promise.resolve();
-	return new Promise((resolve) => {
-		let settled = false;
-		const done = () => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			resolve();
-		};
-		const timeout = setTimeout(done, SSE_FLUSH_TIMEOUT_MS);
-		if (response.writableEnded) {
-			response.once("finish", done);
-			response.once("close", done);
-		} else {
-			response.end(done);
-		}
-	});
-}
 
-function messageDigest(message: ParsedSendRequest): string {
-	const hash = createHash("sha256");
-	for (const value of [message.requestId, message.delivery, String(message.draftRevision)]) {
-		hash
-			.update(String(Buffer.byteLength(value)))
-			.update(":")
-			.update(value);
-	}
-	return hash.digest("hex");
-}
 
-function parseSendRequest(value: unknown): ParsedSendRequest {
-	if (!isRecord(value)) throw new HttpError(400, "Invalid message request");
-	const requestId = stringField(value, "requestId");
-	if (!REQUEST_ID.test(requestId)) throw new HttpError(400, "Invalid request id");
-	const draftRevision = numberField(value, "draftRevision");
-	const delivery = value.delivery;
-	if (delivery !== "next" && delivery !== "steer")
-		throw new HttpError(400, "Invalid delivery mode");
-	return { requestId, draftRevision, delivery };
-}
 
-async function readBytes(request: WebServerRequest, limit: number): Promise<Buffer> {
-	const length = Number(request.headers["content-length"] ?? "0");
-	if (Number.isFinite(length) && length > limit) {
-		throw new HttpError(413, "Request body is too large", true);
-	}
-	const chunks: Buffer[] = [];
-	let total = 0;
-	for await (const chunk of request) {
-		const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-		total += bytes.byteLength;
-		if (total > limit) throw new HttpError(413, "Request body is too large", true);
-		chunks.push(bytes);
-	}
-	return Buffer.concat(chunks);
-}
 
 async function readJson(request: WebServerRequest, limit: number): Promise<unknown> {
 	const chunks: Buffer[] = [];
@@ -927,93 +373,9 @@ async function readJson(request: WebServerRequest, limit: number): Promise<unkno
 	}
 }
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-	if (!isRecord(value)) throw new HttpError(400, `Invalid ${label}`);
-	return value;
-}
 
-function stringField(value: Record<string, unknown>, key: string): string {
-	const field = value[key];
-	if (typeof field !== "string") throw new HttpError(400, `Invalid ${key}`);
-	return field;
-}
 
-function numberField(value: Record<string, unknown>, key: string): number {
-	const field = value[key];
-	if (!Number.isSafeInteger(field) || (field as number) < 0) {
-		throw new HttpError(400, `Invalid ${key}`);
-	}
-	return field as number;
-}
 
-function stringArrayField(value: Record<string, unknown>, key: string): string[] {
-	const field = value[key];
-	if (!Array.isArray(field) || field.some((item) => typeof item !== "string")) {
-		throw new HttpError(400, `Invalid ${key}`);
-	}
-	return field;
-}
-
-function parseAttachmentReservations(value: unknown): Array<{
-	id: string;
-	name: string;
-	size: number;
-	mimeType?: string;
-}> {
-	if (!Array.isArray(value)) throw new HttpError(400, "Invalid attachment list");
-	return value.map((entry) => {
-		const item = requireRecord(entry, "attachment");
-		return {
-			id: stringField(item, "id"),
-			name: stringField(item, "name"),
-			size: numberField(item, "size"),
-			...(typeof item.mimeType === "string" ? { mimeType: item.mimeType } : {}),
-		};
-	});
-}
-
-function parseSentImageReattachments(value: unknown): Array<{
-	retainedId: string;
-	id: string;
-}> {
-	if (!Array.isArray(value) || value.length === 0) {
-		throw new HttpError(400, "Invalid sent-image reattach list");
-	}
-	return value.map((entry) => {
-		const item = requireRecord(entry, "sent-image reattach item");
-		return {
-			retainedId: stringField(item, "retainedId"),
-			id: stringField(item, "id"),
-		};
-	});
-}
-
-function revisionParameter(url: URL): number {
-	const value = url.searchParams.get("revision");
-	if (!value || !/^\d+$/.test(value)) throw new HttpError(400, "Invalid attachment revision");
-	const revision = Number(value);
-	if (!Number.isSafeInteger(revision)) throw new HttpError(400, "Invalid attachment revision");
-	return revision;
-}
-
-function attachmentPathId(
-	pathname: string,
-	action?: "upload" | "retry" | "preview",
-): string | undefined {
-	const suffix = action ? `/${action}` : "";
-	const match = new RegExp(`^/api/attachments/([A-Za-z0-9_-]{1,128})${suffix}$`).exec(pathname);
-	return match?.[1];
-}
-
-function sentImagePathId(pathname: string, action?: "preview"): string | undefined {
-	const suffix = action ? `/${action}` : "";
-	const match = new RegExp(`^/api/sent-images/([A-Za-z0-9_-]{1,128})${suffix}$`).exec(pathname);
-	return match?.[1];
-}
-
-function sameIds(left: readonly string[], right: readonly string[]): boolean {
-	return left.length === right.length && left.every((id, index) => id === right[index]);
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -1023,6 +385,3 @@ function _isNodeError(error: unknown): error is NodeJS.ErrnoException {
 	return error instanceof Error && "code" in error;
 }
 
-function formatError(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}

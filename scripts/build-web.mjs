@@ -1,21 +1,114 @@
 #!/usr/bin/env node
 
-import { constants } from "node:fs";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+/**
+ * Builds the session page.
+ *
+ * The page is agegr/pi-web's own frontend (vendored verbatim under `src/web/pi-web/`), so the build
+ * has to look like theirs: Tailwind 4 compiles their stylesheet, and esbuild bundles their
+ * components with the aliases their sources use. CSS modules get identity class maps, because their
+ * markup only needs the class names to resolve.
+ */
+
+import { execFile } from "node:child_process";
+import { constants, existsSync } from "node:fs";
+import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { build } from "esbuild";
 
+const run = promisify(execFile);
 const packageRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const webRoot = path.join(packageRoot, "src", "web");
+const piWebRoot = path.join(webRoot, "pi-web");
 const checking = process.argv.includes("--check");
 const temporaryRoot = checking ? await mkdtemp(path.join(tmpdir(), "pi-webui-")) : undefined;
 const outputRoot = temporaryRoot ?? webRoot;
+/** CSS modules collected while bundling: their rules join the generated stylesheet. */
+const moduleStyles = [];
+/**
+ * Loaded only when a response contains a Mermaid block, and large enough that bundling it into every
+ * page load would be wasteful. Their code imports it lazily, so leaving it external keeps that.
+ */
+const EXTERNAL = ["mermaid"];
+
+/** Their sources import `@/…`, `next/image`, and CSS modules; this makes all three work here. */
+const piWebPlugin = {
+	name: "pi-web",
+	setup(buildApi) {
+		buildApi.onResolve({ filter: /^@\// }, (args) => ({
+			path: path.join(piWebRoot, args.path.slice(2)),
+		}));
+		// Their sources use the same `.js` specifiers our extension does (Node's convention);
+		// esbuild needs to be told that the file behind them is TypeScript.
+		buildApi.onResolve({ filter: /^\.{1,2}\/.*\.js$/ }, (args) => {
+			const base = path.resolve(args.resolveDir, args.path.slice(0, -3));
+			for (const ext of [".ts", ".tsx", ".jsx", ".js"]) {
+				if (existsSync(base + ext)) return { path: base + ext };
+			}
+			return undefined;
+		});
+		// Their single router user (AppShell) gets the two hooks and the router it reads.
+		buildApi.onResolve({ filter: /^next\/navigation$/ }, () => ({
+			path: path.join(webRoot, "shims", "next-navigation.tsx"),
+		}));
+		buildApi.onResolve({ filter: /^next\/image$/ }, () => ({
+			path: path.join(webRoot, "shims", "next-image.jsx"),
+		}));
+		buildApi.onLoad({ filter: /\.module\.css$/ }, async (args) => {
+			const css = await readFile(args.path, "utf8");
+			moduleStyles.push(css);
+			const names = new Set();
+			for (const match of css.matchAll(/\.([A-Za-z_][\w-]*)/g)) names.add(match[1]);
+			const entries = [...names].map((name) => `${JSON.stringify(name)}: ${JSON.stringify(name)}`);
+			return {
+				loader: "js",
+				contents: `export default { ${entries.join(", ")} };`,
+			};
+		});
+		buildApi.onLoad({ filter: /\.css$/ }, async (args) => {
+			moduleStyles.push(await readFile(args.path, "utf8"));
+			return { loader: "js", contents: "" };
+		});
+	},
+};
+
+/** Their application stylesheets, in their own order, with the Tailwind import handled once above. */
+async function tailwindInput() {
+	// Their layout imports these four after `tailwindcss`; the order is theirs, so the cascade is too.
+	const appSheets = (
+		await Promise.all(
+			["globals", "settings", "sidebar", "sidebar-menu"].map((name) =>
+				readFile(path.join(piWebRoot, "app", `${name}.css`), "utf8"),
+			),
+		)
+	)
+		.map((sheet) => sheet.replace(/@import "tailwindcss";\s*/g, "").replace(/@source not "[^"]*";\s*/g, ""))
+		.join("\n\n")
+		// Their layout loads this through `next/font`; we point the same variable at a local stack.
+		.replace(
+			"--font-mono-default:",
+			"--font-mono-default: ui-monospace, SFMono-Regular, 'Noto Sans Mono', Menlo, monospace, ",
+		);
+
+	return `@import "tailwindcss";
+@source "../pi-web/components/**/*.tsx";
+@source "../pi-web/hooks/**/*.tsx";
+
+${appSheets}
+
+/* Their layout's own stylesheet imports, both from node_modules. */
+@import "katex/dist/katex.min.css";
+@import "@xterm/xterm/css/xterm.css";
+
+${moduleStyles.join("\n\n")}
+`;
+}
 
 try {
 	await build({
-		entryPoints: [path.join(webRoot, "ui", "app.jsx")],
+		entryPoints: [path.join(webRoot, "session.jsx")],
 		bundle: true,
 		minify: true,
 		legalComments: "inline",
@@ -23,16 +116,29 @@ try {
 		jsx: "automatic",
 		platform: "browser",
 		target: ["es2022"],
+		plugins: [piWebPlugin],
+		external: EXTERNAL,
 		outdir: outputRoot,
 		entryNames: "app",
-		assetNames: "[name]",
 		define: { "process.env.NODE_ENV": '"production"' },
 		banner: {
 			js: `/* Generated by scripts/build-web.mjs. Do not edit directly. */
 const __webpack_nonce__ = document.querySelector('meta[name="csp-nonce"]')?.content;`,
-			css: "/* Generated by scripts/build-web.mjs. Do not edit directly. */",
 		},
 	});
+
+	const cssInput = path.join(webRoot, ".tailwind-input.css");
+	await writeFile(cssInput, await tailwindInput());
+	try {
+		await run(
+			path.join(packageRoot, "node_modules", ".bin", "tailwindcss"),
+			["--input", cssInput, "--output", path.join(outputRoot, "app.css"), "--minify"],
+			{ cwd: packageRoot },
+		);
+	} finally {
+		await rm(cssInput, { force: true });
+	}
+
 	for (const name of ["app.js", "app.css"]) {
 		const outputPath = path.join(outputRoot, name);
 		const normalized = (await readFile(outputPath, "utf8")).replace(/[\t ]+$/gm, "");
@@ -57,3 +163,7 @@ const __webpack_nonce__ = document.querySelector('meta[name="csp-nonce"]')?.cont
 } finally {
 	if (temporaryRoot) await rm(temporaryRoot, { recursive: true, force: true });
 }
+
+// Keep the helper importable from tests without executing the build: this file only builds.
+void mkdir;
+void readdir;

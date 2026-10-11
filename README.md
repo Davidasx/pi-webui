@@ -8,7 +8,7 @@ A private browser view of the Pi session that is running in your terminal, share
 fixed port across all of your Pi sessions.
 
 This is a port of [`narumiruna/pi-extensions/deprecated/pi-webui`](https://github.com/narumiruna/pi-extensions/tree/main/deprecated/pi-webui)
-(MIT, archived upstream) with four deliberate changes:
+(MIT, archived upstream) with five deliberate changes:
 
 1. **No authentication.** The hub is loopback-only and answers directly: open
    `http://127.0.0.1:43118/` and you are in. Remote access is the operator's job — put your own
@@ -20,6 +20,9 @@ This is a port of [`narumiruna/pi-extensions/deprecated/pi-webui`](https://githu
    forwards the browser's requests to whichever session owns the page.
 4. **A UI change needs only a hub restart.** The page and its bundle are served by the hub, so
    editing the interface never requires reloading every Pi session.
+5. **The page is agegr/pi-web's own frontend, copied verbatim.** Components, styles, sidebar, panels
+   and the API routes behind them come from upstream, so what you see is that interface rather than an
+   imitation of it; `src/web/pi-web/PORTING.md` explains how the copy is kept in step.
 
 ## Why this design does not fight with the terminal
 
@@ -34,22 +37,26 @@ out of scope.
 
 pi-webui avoids the whole class of problem structurally:
 
-- The HTTP server runs **inside the Pi process** (`server.listen(0, "127.0.0.1")`), one per session.
+- Each session answers its own API **from inside its Pi process**: the hub tunnels the browser's
+  requests over that session's WebSocket, and no Pi process opens a port.
 - Browser input enters through the normal Pi input path
   (`pi.sendUserMessage(content, { deliverAs })`), exactly like terminal typing, so the terminal and
   the browser share one runtime, one conversation tree, and one writer.
 - Pi core persists the session; pi-webui never writes session files.
 - The hub only routes: it holds a registry of live sessions, a landing page, and a proxy.
 
-The trade-off is scope: one session per page, no session manager, no shell, file browser, git UI,
-or task board, and the page lives only as long as that Pi session.
+The page itself is upstream's: a session sidebar, the chat surface, a file explorer and viewer, git
+status and diffs, skills, models, plugins, MCP and settings — every one of those served by the routes
+copied from upstream, running against this machine. What is deliberately not here is anything that
+would need a second agent process: starting a session from the browser, forking one that is not
+running, or a terminal panel. The page lives as long as that Pi session.
 
 ## Requirements
 
 - **Node.js ≥ 22.18** for the hub (`bin/pi-webui-hub.mjs` loads the TypeScript source through
   Node's built-in type stripping, so there is no build step). Node 24/26 are what this was tested on.
 - Pi Coding Agent, and the extension installed in a session that has `git` available if you use
-  the image pipeline's optional formats (sharp handles PNG/JPEG/WebP/GIF/BMP/TIFF/HEIF/AVIF).
+  the extension itself needs nothing beyond Node and Pi.
 
 ## Install
 
@@ -117,8 +124,8 @@ In a terminal Pi session:
 | `/webui` | Current-state menu (open, settings, status, help) |
 | `/webui open` | Publish this session to the hub and print its link |
 | `/webui hub` | Print the systemd unit and install steps |
-| `/webui status` | Server, hub, link, startup, image limits, settings path |
-| `/webui settings` | TUI settings screen (`startOnSessionStart` is the only exposed switch) |
+| `/webui status` | Server, hub, link, startup, settings file path |
+| `/webui settings` | TUI settings screen (`startOnSessionStart`, the hub port, allowed hosts) |
 | `/webui init` | Create the defaults file without overwriting anything |
 | `/webui help` | Command and settings help |
 
@@ -175,11 +182,6 @@ $PI_CODING_AGENT_DIR/pi-webui.json      # else ~/.pi/agent/pi-webui.json
 ```json
 {
   "startOnSessionStart": false,
-  "retainSentImages": false,
-  "maxImages": 8,
-  "maxImageBytes": 10485760,
-  "maxBatchBytes": 41943040,
-  "maxImagePixels": 50000000,
   "hub": {
     "port": 43118,
     "allowedHosts": ["pi.example.com"]
@@ -262,8 +264,10 @@ npm run hub         # run the hub in the foreground
 Layout: `src/hub.ts` (the one web server: page, assets, channel registry, tunnel; run directly by
 Node through type stripping), `src/hub-channel.ts` (the extension's WebSocket client, with
 reconnect), `src/hub-protocol.ts` (shared contract), `src/server.ts` (a session's web API, driven by
-the channel and transport-agnostic), `src/runtime.ts` (Pi integration: events, commands, controls),
-`src/web/ui/*` (React client, bundled into `src/web/app.js`).
+the channel and transport-agnostic), `src/vendored-routes.ts` (mounts the API routes copied from
+upstream), `src/runtime.ts` (Pi integration: events, commands, the bridge upstream's pages call),
+`src/web/pi-web/**` (upstream's frontend and routes, copied verbatim — see `PORTING.md`),
+`src/web/session.jsx` (the mount point) and `src/web/shims/**` (their three Next.js imports).
 
 ## Behind a proxy or tunnel
 

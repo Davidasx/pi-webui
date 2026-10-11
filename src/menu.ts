@@ -48,7 +48,7 @@ export function webUIMenuItems(state: WebUIMenuState): WebUIMenuItem[] {
 		{
 			value: "status",
 			label: "Status & diagnostics",
-			description: "Review effective startup, settings source, image limits, hub state, and server state.",
+			description: "Review effective startup, settings source, hub state, and server state.",
 		},
 		{
 			value: "help",

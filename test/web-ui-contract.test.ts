@@ -1,146 +1,68 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { test } from "vitest";
 
-const root = path.join(process.cwd(), "src/web");
-const [html, app, overlays, client, styles, markdown, imageDrag] = await Promise.all([
-	readFile(path.join(root, "index.html"), "utf8"),
-	readFile(path.join(root, "ui/app.jsx"), "utf8"),
-	readFile(path.join(root, "ui/overlays.jsx"), "utf8"),
-	readFile(path.join(root, "ui/client.js"), "utf8"),
-	readFile(path.join(root, "ui/styles.css"), "utf8"),
-	readFile(path.join(root, "markdown.js"), "utf8"),
-	readFile(path.join(root, "image-drag.js"), "utf8"),
+/**
+ * What the page is made of.
+ *
+ * The behaviour its endpoints owe the browser is in `browser-contract.test.ts`; this file only checks
+ * the pieces that cannot be exercised over HTTP — that the page is their frontend mounted rather than
+ * re-drawn, and that the copy, its licence and its shims are all present.
+ */
+
+const root = process.cwd();
+const read = (relative: string) => readFile(path.join(root, relative), "utf8");
+
+const [html, session, _server, _hub, build, porting, vendor] = await Promise.all([
+	read("src/web/index.html"),
+	read("src/web/session.jsx"),
+	read("src/server.ts"),
+	read("src/hub.ts"),
+	read("scripts/build-web.mjs"),
+	read("src/web/pi-web/PORTING.md"),
+	read("scripts/vendor-web.mjs"),
 ]);
 
-test("page hierarchy keeps session context, transcript, and composer in reading order", () => {
+test("the page is agegr/pi-web's own frontend, mounted rather than re-drawn", async () => {
+	// Their own application shell is the page: sidebar, top bar, panels and chat surface.
+	assert.match(session, /from "\.\/pi-web\/components\/AppShell"/);
+	assert.match(session, /<AppShell \/>/);
 	assert.match(html, /id="root"/);
-	assert.match(app, /<SessionHeader[\s\S]*<Conversation[\s\S]*<Composer/);
-	assert.match(app, /id="transcript"/);
-	assert.doesNotMatch(app, /id="transcript"[^>]*aria-live/);
-	assert.match(app, /id="transcript-status"/);
-	assert.match(app, /aria-live="polite"/);
-	assert.match(app, /id="message-input"/);
-	assert.match(app, /aria-label="Message Pi"/);
-	assert.match(app, /id="send-next"/);
-	assert.match(app, /id="composer-status"/);
-	assert.match(app, /id="blocking-state"/);
-	assert.match(app, /id="attachment-summary"/);
-	assert.match(app, /id="attachment-announcement"/);
+	assert.match(html, /src="\/app\.js"/);
+	assert.match(html, /href="\/app\.css"/);
+
+	// The copy is present, licensed, and documented.
+	await stat(path.join(root, "src/web/pi-web/LICENSE.agegr-pi-web"));
+	await stat(path.join(root, "src/web/pi-web/components/AppShell.tsx"));
+	await stat(path.join(root, "src/web/pi-web/components/MessageView.tsx"));
+	await stat(path.join(root, "src/web/pi-web/components/ChatInput.tsx"));
+	assert.match(porting, /byte-identical copy/);
 });
 
-test("browser client claims a lease, reconnects, and keeps failed drafts through hub-relative paths", () => {
-	assert.match(client, /crypto\.randomUUID\(\)/);
-	assert.match(client, /fetch\(api\("lease"\)/);
-	assert.match(client, /new EventSource\(api\(`events\?since=\$\{model\.sequence\}`\)\)/);
-	assert.match(client, /fetch\(api\("messages"\)/);
-	assert.match(client, /fetch\(api\("draft"\)/);
-	assert.match(client, /scheduleDraftSave\(\)/);
-	assert.match(client, /flushDraftText\(\)/);
-	assert.match(client, /acknowledgeDraftText/);
-	assert.match(client, /draftRevision: attempt\.draftRevision/);
-	assert.match(client, /prepareSend\(model, crypto\.randomUUID\(\), steer \? "steer" : "next"\)/);
-	assert.match(client, /delivery: attempt\.delivery/);
-	assert.match(client, /applyConversationEvent/);
-	assert.match(client, /applySnapshot/);
-	assert.match(client, /completeSend/);
-	assert.match(client, /failSend/);
-	assert.match(client, /if \(!model\.leaseClaimed\) await claimLease\(\)/);
-	// A proxy in front of the page can buffer or cut the event stream without EventSource noticing.
-	assert.match(client, /STREAM_STALL_MS/);
-	assert.match(client, /void refreshSnapshot\(\).catch\(connectionFailure\)/);
-	assert.doesNotMatch(`${app}\n${client}`, /localStorage|sessionStorage|indexedDB/i);
-	// The page lives at the hub root and picks its session with ?session=, so every request is
-	// built from that id instead of a hard-coded absolute URL.
-	assert.match(client, /new URLSearchParams\(window\.location\.search\)\.get\("session"\)/);
-	assert.match(client, /api\/session\/\$\{encodeURIComponent\(sessionId\)\}\//);
-	assert.doesNotMatch(`${app}\n${client}`, /["'`]\/api\//);
+test("their Next.js imports are shimmed where a bundler is not in the way", async () => {
+	// The browser bundle aliases them, and the copy points at the shims directly so the extension can
+	// load the same files through Node.
+	assert.ok(build.includes("/^next\\/image$/"), "the bundle aliases next/image");
+	assert.ok(build.includes("/^next\\/navigation$/"), "the bundle aliases next/navigation");
+	// `next/server` appears only in the copied route handlers, which Node loads directly: the
+	// vendoring script points those imports at the shim instead of relying on a bundler alias.
+	assert.ok(vendor.includes('["next/server", "../shims/next-server.ts"]'), "server imports point at the shim");
+	await stat(path.join(root, "src/web/shims/next-image.jsx"));
+	await stat(path.join(root, "src/web/shims/next-navigation.tsx"));
+	await stat(path.join(root, "src/web/shims/next-server.ts"));
+	assert.match(vendor, /PACKAGE_SHIMS/);
+
+	// Their routes come in through the copy too, and the ones that talk to the agent stay ours.
+	assert.match(vendor, /OWN_ROUTES/);
+	await stat(path.join(root, "src/web/pi-web/app/api/files/[...path]/route.ts"));
+	assert.match(vendor, /lib\/rpc-manager\.ts/);
 });
 
-test("image input stages uploads with status and recovery", () => {
-	assert.match(app, /const ACCEPTED_IMAGES/);
-	for (const format of [
-		"image/png",
-		"image/jpeg",
-		"image/webp",
-		"image/gif",
-		"image/bmp",
-		"image/tiff",
-		"image/heic",
-		"image/heif",
-		"image/avif",
-	]) {
-		assert.match(app, new RegExp(format.replace("/", "\\/")));
-	}
-	assert.match(client, /model\.imageLimits/);
-	assert.match(client, /limits\.maxImages/);
-	assert.match(client, /limits\.maxImageBytes/);
-	assert.match(client, /limits\.maxBatchBytes/);
-	assert.match(client, /new XMLHttpRequest\(\)/);
-	assert.match(client, /request\.upload\.addEventListener\("progress"/);
-	assert.match(client, /X-Pi-Web-Client/);
-	assert.match(client, /api\("attachments\/reserve"\)/);
-	assert.match(client, /\/upload\?revision=/);
-	assert.match(client, /\/retry/);
-	assert.match(app, /Paste, drop, or choose images\./);
-	assert.match(app, /Sensitive metadata is removed before sending\./);
-	assert.match(app, /attachmentItemLabel/);
-	assert.match(app, /Retry/);
-	assert.match(app, /Remove image/);
-	assert.match(overlays, /Dialog\.Root/);
-	assert.match(app, /previewReturnFocus\.current = trigger \?\? document\.activeElement/);
-	assert.match(app, /previewReturnFocus\.current\?\.focus\(\)/);
-	assert.match(
-		app,
-		/className="attachment-preview"[\s\S]*onClick=\{\(event\) => onPreview\(image, event\.currentTarget\)\}[\s\S]*type="button"/,
-	);
-	assert.match(app, /Alt\+ArrowUp Alt\+ArrowDown/);
-	assert.match(app, /Order \{index \+ 1\} of \{model\.images\.length\}/);
-	assert.match(client, /api\("attachments\/clear"\)/);
-	assert.doesNotMatch(`${app}\n${client}`, /URL\.createObjectURL|URL\.revokeObjectURL/);
-});
-
-test("drag ordering gives directional feedback and updates before request settlement", () => {
-	assert.match(app, /dropAfterTarget/);
-	assert.match(app, /imagesStackVertically/);
-	assert.match(client, /moveImageBefore/);
-	assert.match(client, /moveImageAfter/);
-	assert.match(client, /model = \{ \.\.\.model, images \}/);
-	assert.match(styles, /\.image-preview-item\.drag-before/);
-	assert.match(styles, /\.image-preview-item\.drag-after/);
-	assert.match(imageDrag, /export function dropAfterTarget/);
-});
-
-test("sent-image actions stay contextual and distinguish expiration", () => {
-	assert.match(client, /events\.addEventListener\("sent-images"/);
-	assert.match(client, /api\("sent-images\/reattach"\)/);
-	assert.match(client, /api\(`sent-images\/\$\{encodeURIComponent\(retainedImageId\)\}/);
-	assert.match(app, /Attach again/);
-	assert.match(app, /Forget/);
-	assert.match(app, /Expired/);
-	assert.match(app, /retainedImageStatus/);
-	assert.doesNotMatch(app, /sent-image-gallery|retained-image-gallery/);
-});
-
-test("tool, thinking, and Markdown rendering remain safe", () => {
-	assert.match(app, /Collapsible\.Root/);
-	assert.match(app, /Thinking/);
-	assert.match(app, /parseMarkdown/);
-	assert.match(app, /<MarkdownBlock/);
-	assert.doesNotMatch(
-		`${app}\n${markdown}`,
-		/dangerouslySetInnerHTML|innerHTML|insertAdjacentHTML|document\.write/,
-	);
-});
-
-test("the ported stylesheet keeps the transcript readable and theme-aware", () => {
-	assert.match(styles, /--chat-content-max-width:\s*820px/);
-	assert.match(styles, /--chat-content-font-size:\s*14px/);
-	assert.match(styles, /prefers-color-scheme: dark/);
-	assert.match(styles, /overflow-wrap:\s*anywhere/);
-	assert.match(styles, /white-space:\s*pre-wrap/);
-	assert.match(styles, /\.tool\.failed/);
-	assert.match(styles, /\.thinking-text/);
-	assert.match(styles, /max-width:\s*var\(--chat-content-max-width\)/);
+test("the front page is their app, not a session picker", async () => {
+	// A session list page used to live here; the list belongs to the app's own sidebar.
+	const landing = await read("src/hub.ts");
+	assert.doesNotMatch(landing, /function landingPage/);
+	assert.match(landing, /302/, "the root names a session instead of listing them");
+	assert.match(landing, /The app itself is the front page/);
 });

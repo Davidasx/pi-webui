@@ -13,5 +13,6 @@
 		"types": ["node"],
 		"rootDir": "."
 	},
-	"include": ["src/**/*.ts", "test/**/*.ts"]
+	"include": ["src/**/*.ts", "test/**/*.ts", "src/**/*.tsx"],
+	"exclude": ["src/web/pi-web/**", "src/web/shims/**", "src/web/session.jsx"]
 }

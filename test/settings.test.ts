@@ -4,68 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "vitest";
 import { DEFAULT_HUB_PORT } from "../src/hub-protocol.js";
-import { DEFAULT_IMAGE_LIMITS, IMAGE_HARD_LIMITS } from "../src/image-limits.js";
 import {
 	DEFAULT_SETTINGS,
 	initializeSettings,
 	loadSettings,
 	normalizeSettings,
-	RETENTION_HARD_LIMITS,
 	type SettingsFileOperations,
 	saveSettings,
 	settingsDocument,
 } from "../src/settings.js";
-
-test("sent-image retention uses conservative opt-in defaults and finite hard ceilings", () => {
-	assert.deepEqual(
-		{
-			retainSentImages: DEFAULT_SETTINGS.retainSentImages,
-			maxRetainedImages: DEFAULT_SETTINGS.maxRetainedImages,
-			maxRetainedBytes: DEFAULT_SETTINGS.maxRetainedBytes,
-		},
-		{ retainSentImages: false, maxRetainedImages: 32, maxRetainedBytes: 128 * 1024 * 1024 },
-	);
-	assert.deepEqual(RETENTION_HARD_LIMITS, {
-		maxRetainedImages: 128,
-		maxRetainedBytes: 512 * 1024 * 1024,
-	});
-});
-
-test("image limit normalization preserves defaults and accepts exact hard boundaries", () => {
-	assert.deepEqual(normalizeSettings({}), DEFAULT_SETTINGS);
-	assert.deepEqual(normalizeSettings(IMAGE_HARD_LIMITS), {
-		...DEFAULT_SETTINGS,
-		...IMAGE_HARD_LIMITS,
-	});
-	for (const key of Object.keys(DEFAULT_IMAGE_LIMITS)) {
-		assert.equal(normalizeSettings({ [key]: 1.5 }), undefined);
-		assert.equal(normalizeSettings({ [key]: 0 }), undefined);
-		assert.equal(
-			normalizeSettings({ [key]: IMAGE_HARD_LIMITS[key as keyof typeof IMAGE_HARD_LIMITS] + 1 }),
-			undefined,
-		);
-	}
-	assert.equal(normalizeSettings({ maxImageBytes: 20, maxBatchBytes: 10 }), undefined);
-});
-
-test("loaded limits above defaults warn while omitted values and unknown fields remain safe", async () => {
-	const directory = await mkdtemp(path.join(os.tmpdir(), "pi-webui-settings-"));
-	const settingsPath = path.join(directory, "pi-webui.json");
-	try {
-		await writeFile(
-			settingsPath,
-			JSON.stringify({ maxImages: DEFAULT_IMAGE_LIMITS.maxImages + 1, future: "kept" }),
-		);
-		const loaded = await loadSettings(settingsPath);
-		assert.equal(loaded.kind, "loaded");
-		assert.equal(loaded.settings.maxImages, 9);
-		assert.equal(loaded.settings.maxImageBytes, DEFAULT_IMAGE_LIMITS.maxImageBytes);
-		assert.match(loaded.warning ?? "", /above safe defaults.*maxImages/i);
-		assert.deepEqual(loaded.document, { maxImages: 9, future: "kept" });
-	} finally {
-		await rm(directory, { recursive: true, force: true });
-	}
-});
 
 test("missing settings loads do not create the file or its parent directory", async () => {
 	const directory = await mkdtemp(path.join(os.tmpdir(), "pi-webui-settings-missing-"));
@@ -127,13 +74,6 @@ test("saving is atomic and preserves unknown fields", async () => {
 		assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
 			future: { enabled: true },
 			startOnSessionStart: true,
-			retainSentImages: false,
-			maxRetainedImages: 32,
-			maxRetainedBytes: 128 * 1024 * 1024,
-			maxImages: 8,
-			maxImageBytes: 10 * 1024 * 1024,
-			maxBatchBytes: 40 * 1024 * 1024,
-			maxImagePixels: 50_000_000,
 			hub: { port: DEFAULT_HUB_PORT, allowedHosts: [] },
 		});
 	} finally {

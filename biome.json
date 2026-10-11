@@ -6,7 +6,14 @@
 		"useIgnoreFile": true
 	},
 	"files": {
-		"includes": ["**", "!node_modules", "!package-lock.json", "!src/web/app.js", "!src/web/app.css"]
+		"includes": [
+			"**",
+			"!node_modules",
+			"!package-lock.json",
+			"!src/web/app.js",
+			"!src/web/app.css",
+			"!src/web/pi-web/**"
+		]
 	},
 	"formatter": {
 		"enabled": false

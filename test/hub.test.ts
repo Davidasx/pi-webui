@@ -4,7 +4,6 @@ import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "vitest";
-import { ConversationProjection } from "../src/conversation.js";
 import { type Hub, startHub } from "../src/hub.js";
 import { HubChannel } from "../src/hub-channel.js";
 import {
@@ -16,26 +15,27 @@ import {
 	sessionApiPath,
 	sessionBasePath,
 } from "../src/hub-protocol.js";
-import { type WebSendRequest, WebUIServer } from "../src/server.js";
+import { WebUIServer } from "../src/server.js";
 
 /**
  * A session stands in for a real Pi process: the same web service the extension builds, driven by
  * the same channel client, dialing a real hub over a real WebSocket.
  */
 async function createSession(hub: Hub, hubUrl: string, sessionId: string, projectName = "demo") {
-	const conversation = new ConversationProjection({
-		id: sessionId,
-		cwd: `/workspace/${projectName}`,
-		projectName,
-	});
-	const sends: WebSendRequest[] = [];
+	const commands: Record<string, unknown>[] = [];
 	const service = typeService(
 		WebUIServer.create(
 			{
-				conversation,
-				send: async (request) => {
-					sends.push(request);
-					return { delivery: request.delivery === "steer" ? "steer" : "immediate" };
+				piWeb: {
+					sessionId: () => sessionId,
+					command: async (command) => {
+						commands.push(command);
+						return { accepted: true };
+					},
+					state: async () => ({ model: { provider: "demo", id: "model" } }),
+					autoName: async () => undefined,
+					isRunning: () => false,
+					subscribe: () => () => undefined,
 				},
 			},
 			hubUrl.replace(/\/+$/, ""),
@@ -66,7 +66,7 @@ async function createSession(hub: Hub, hubUrl: string, sessionId: string, projec
 		sessionId,
 		service,
 		channel,
-		sends,
+		commands,
 		async stop() {
 			channel.stop();
 			await service.close();
@@ -135,15 +135,18 @@ test("hub lists sessions, serves the page, and tunnels each session's API", asyn
 	const first = await createSession(hub, hubUrl, "session-alpha", "alpha");
 	const second = await createSession(hub, hubUrl, "session-beta", "beta");
 	try {
-		const index = await fetch(hubUrl);
-		const indexHtml = await index.text();
-		assert.equal(index.status, 200);
-		assert.match(indexHtml, /session-alpha/);
-		assert.match(indexHtml, /session-beta/);
-		assert.match(indexHtml, new RegExp(`${SESSION_PATH_PREFIX}session-alpha/`));
+		// The front page is the app itself: the root names the newest session so the browser lands in
+		// a working session, and the session list lives in the app's own sidebar.
+		const root = await fetch(hubUrl, { redirect: "manual" });
+		assert.equal(root.status, 302);
+		const target = root.headers.get("location") ?? "";
+		assert.match(target, /^\/\?session=/);
+		await root.body?.cancel();
 
-		// The hub serves the page shell at the root, selected with ?session=, so a UI change needs
-		// only a hub restart.
+		// The list the sidebar shows comes from a session, which reads the sessions on disk.
+		const list = await fetch(new URL(`${SESSION_PATH_PREFIX}session-alpha/api/sessions`, hubUrl));
+		assert.equal(list.status, 200);
+		await list.body?.cancel();
 		const page = await fetch(`${hubUrl}?session=session-alpha`);
 		const pageHtml = await page.text();
 		assert.equal(page.status, 200);
@@ -163,47 +166,33 @@ test("hub lists sessions, serves the page, and tunnels each session's API", asyn
 		assert.equal(legacy.headers.get("location"), "/?session=session-alpha");
 		await legacy.body?.cancel();
 
-		const state = await fetch(new URL(`${sessionApiPath("session-alpha")}state`, hubUrl));
-		assert.equal(state.status, 200);
-		assert.equal(((await state.json()) as { session: { projectName: string } }).session.projectName, "alpha");
+		// Their composer's liveness probe: a plain GET that must answer with the live state.
+		const probe = await fetch(new URL(`${sessionApiPath("session-alpha")}agent/session-alpha`, hubUrl));
+		assert.equal(probe.status, 200);
+		assert.equal(((await probe.json()) as { running: boolean }).running, true);
 
-		const lease = await fetch(new URL(`${sessionApiPath("session-alpha")}lease`, hubUrl), {
+		// A prompt from the browser reaches exactly the session the URL named.
+		const sent = await fetch(new URL(`${sessionApiPath("session-alpha")}agent/session-alpha`, hubUrl), {
 			method: "POST",
 			headers: { "content-type": "application/json", origin: hubUrl.slice(0, -1), "x-pi-web-client": "tab-1" },
-			body: JSON.stringify({ clientId: "tab-1" }),
+			body: JSON.stringify({ type: "prompt", message: "hello from the browser" }),
 		});
-		assert.equal(lease.status, 200);
-		await lease.body?.cancel();
-
-		const draft = await fetch(new URL(`${sessionApiPath("session-alpha")}draft`, hubUrl), {
-			method: "POST",
-			headers: { "content-type": "application/json", origin: hubUrl.slice(0, -1), "x-pi-web-client": "tab-1" },
-			body: JSON.stringify({ requestId: "draft-1", revision: 0, text: "hello from the browser" }),
-		});
-		assert.equal(draft.status, 200);
-		await draft.body?.cancel();
-
-		const sent = await fetch(new URL(`${sessionApiPath("session-alpha")}messages`, hubUrl), {
-			method: "POST",
-			headers: { "content-type": "application/json", origin: hubUrl.slice(0, -1), "x-pi-web-client": "tab-1" },
-			body: JSON.stringify({ requestId: "request-1", draftRevision: 1, delivery: "next" }),
-		});
-		assert.equal(sent.status, 202);
+		assert.equal(sent.status, 200);
 		await sent.body?.cancel();
-		assert.equal(first.sends.length, 1);
-		assert.equal(first.sends[0]?.text, "hello from the browser");
+		assert.deepEqual(first.commands, [{ type: "prompt", message: "hello from the browser" }]);
 		// Routing must never leak a session's traffic to another session.
-		assert.equal(second.sends.length, 0);
+		assert.equal(second.commands.length, 0);
 
 		// A cross-origin mutation never reaches the session: the hub forwards no validated origin,
 		// and the session's own check refuses it.
-		const hostile = await fetch(new URL(`${sessionApiPath("session-alpha")}lease`, hubUrl), {
+		const hostile = await fetch(new URL(`${sessionApiPath("session-alpha")}agent/session-alpha`, hubUrl), {
 			method: "POST",
 			headers: { "content-type": "application/json", origin: "http://attacker.invalid", "x-pi-web-client": "tab-1" },
-			body: JSON.stringify({ clientId: "tab-1" }),
+			body: JSON.stringify({ type: "prompt", message: "should not arrive" }),
 		});
 		assert.equal(hostile.status, 403);
 		await hostile.body?.cancel();
+		assert.equal(first.commands.length, 1);
 	} finally {
 		await Promise.all([first.stop(), second.stop()]);
 		await hub.close();
@@ -215,20 +204,15 @@ test("hub streams a session's server-sent events through the channel", async () 
 	const hubUrl = `http://127.0.0.1:${hub.port}/`;
 	const session = await createSession(hub, hubUrl, "session-events");
 	try {
-		const response = await fetch(new URL(`${sessionApiPath("session-events")}events?since=0`, hubUrl));
+		const response = await fetch(new URL(`${sessionApiPath("session-events")}agent/session-events/events`, hubUrl));
 		assert.equal(response.status, 200);
 		assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
 		const reader = response.body?.getReader();
 		assert.ok(reader, "a streaming response must be readable");
 		const decoder = new TextDecoder();
-		let text = "";
-		for (let attempt = 0; attempt < 50 && !text.includes("event: lease"); attempt += 1) {
-			const chunk = await reader.read();
-			if (chunk.done) break;
-			text += decoder.decode(chunk.value, { stream: true });
-		}
-		assert.match(text, /retry: 2000/);
-		assert.match(text, /event: lease/);
+		const first = await reader.read();
+		const text = decoder.decode(first.value, { stream: true });
+		assert.match(text, /"type":"connected"/, "their composer waits for this frame before sending");
 		// A streaming response must outlive the handler call that set it up: returning from the
 		// handler must not end the stream.
 		const closedEarly = await Promise.race([
@@ -257,7 +241,7 @@ test("a session whose channel dropped answers with a reconnecting page", async (
 		await waitFor(() => hub.sessions()[0]?.stale === true, "the hub marks a session without a channel");
 		const offline = await fetch(`${hubUrl}?session=session-reconnecting`);
 		assert.equal(offline.status, 200, "the page stays available while a session reconnects");
-		const api = await fetch(new URL(`${sessionApiPath("session-reconnecting")}state`, hubUrl));
+		const api = await fetch(new URL(`${sessionApiPath("session-reconnecting")}agent/session-reconnecting`, hubUrl));
 		assert.equal(api.status, 502);
 		assert.match(await api.text(), /reconnecting/);
 	} finally {
@@ -273,9 +257,13 @@ test("the hub forgets a session once its grace period passes", async () => {
 	try {
 		session.channel.stop();
 		await waitFor(() => hub.sessions().length === 0, "the hub forgets a session after its grace period");
+		// The page stays up: it is the app, whose sidebar lists whatever is connected, not a dead end
+		// for the session that just went away. Its API is what reports the session is gone.
 		const gone = await fetch(`${hubUrl}?session=session-forgotten`);
-		assert.equal(gone.status, 404);
-		assert.match(await gone.text(), /not connected/);
+		assert.equal(gone.status, 200);
+		assert.match(await gone.text(), /id="root"/);
+		const api = await fetch(new URL(`${sessionApiPath("session-forgotten")}agent/session-forgotten`, hubUrl));
+		assert.equal(api.status, 404);
 	} finally {
 		await session.stop();
 		await hub.close();
@@ -295,7 +283,7 @@ test("a restarted hub is repopulated by reconnecting sessions", async () => {
 				() => replacement.sessions().length === 1 && replacement.sessions()[0]?.stale === false,
 				"the session reconnects to the replacement hub",
 			);
-			const state = await fetch(new URL(`${sessionApiPath("session-restart")}state`, hubUrl));
+			const state = await fetch(new URL(`${sessionApiPath("session-restart")}agent/session-reconnecting`, hubUrl));
 			assert.equal(state.status, 200);
 			await state.body?.cancel();
 		} finally {
@@ -340,52 +328,6 @@ test("hub host validation stays strict and the control plane is read-only", asyn
 	} finally {
 		await hub.close();
 		rmSync(dir, { recursive: true, force: true });
-	}
-});
-
-test("the session index page streams updates instead of reloading", async () => {
-	const hub = await startHub({ port: 0 });
-	const hubUrl = `http://127.0.0.1:${hub.port}/`;
-	const session = await createSession(hub, hubUrl, "session-streamed");
-	try {
-		const page = await fetch(hubUrl);
-		const html = await page.text();
-		assert.doesNotMatch(html, /http-equiv="refresh"/, "the index must not reload itself");
-		assert.match(html, /new EventSource\("\/_hub\/events"\)/);
-		assert.match(html, /<script nonce="[A-Za-z0-9_-]+">/);
-		assert.match(html, /<ul class="sessions" id="sessions">/);
-		const nonce = /<script nonce="([A-Za-z0-9_-]+)">/.exec(html)?.[1];
-		assert.ok(nonce);
-		const policy = page.headers.get("content-security-policy") ?? "";
-		assert.match(policy, /default-src 'none'/);
-		assert.match(policy, new RegExp(`style-src 'nonce-${nonce}'`));
-		assert.match(policy, new RegExp(`script-src 'nonce-${nonce}'`));
-
-		const events = await fetch(`${hubUrl}_hub/events`);
-		assert.equal(events.status, 200);
-		assert.match(events.headers.get("content-type") ?? "", /text\/event-stream/);
-		const reader = events.body?.getReader();
-		assert.ok(reader);
-		const decoder = new TextDecoder();
-		let text = decoder.decode((await reader.read()).value);
-		assert.match(text, /event: sessions/);
-
-		// Connecting another session must push a new snapshot to the open stream.
-		const extra = await createSession(hub, hubUrl, "session-pushed");
-		try {
-			for (let attempt = 0; attempt < 100 && !text.includes("session-pushed"); attempt += 1) {
-				const chunk = await reader.read();
-				if (chunk.done) break;
-				text += decoder.decode(chunk.value, { stream: true });
-			}
-			assert.match(text, /session-pushed/);
-		} finally {
-			await extra.stop();
-		}
-		await reader.cancel().catch(() => undefined);
-	} finally {
-		await session.stop();
-		await hub.close();
 	}
 });
 

@@ -50,8 +50,6 @@ function createRuntime(
 		initializeSettings: async () => "created",
 		createService: () => stubServerControl(),
 		createChannel: (options) => stubChannel({ ...options, hubUrl: HUB_TEST_URL }),
-		readPiSettings: async () => ({ autoResize: true, blockImages: false, warnings: [] }),
-		processImages: async () => [],
 		...overrides,
 	});
 	runtime.register();
@@ -106,17 +104,13 @@ test("webui command completes and routes settings, status, help, and invalid arg
 	await command.handler("status", context.ctx);
 	const status = context.notifications.at(-1)?.message ?? "";
 	assert.match(status, /Startup: Manual.*defaults/is);
-	assert.match(
-		status,
-		/Image limits \(defaults\): 8 images, 10 MiB\/image, 40 MiB\/batch, 50,000,000 pixels\/image/,
-	);
+	assert.match(status, /settings: .*pi-webui\.json/i);
 	assert.match(status, /server: stopped/i);
 	assert.match(status, /hub: not started \(http:\/\/127\.0\.0\.1:43118\/\)/i);
 	await command.handler("help", context.ctx);
 	const help = context.notifications.at(-1)?.message ?? "";
 	assert.match(help, /\/webui \[open\|hub\|settings\|status\|help\|init\]/i);
 	assert.match(help, /"startOnSessionStart": false/);
-	assert.match(help, /maxImages.*maxImageBytes.*maxBatchBytes.*maxImagePixels/i);
 	assert.match(help, /provider-ready dimension\/Base64 limits are fixed/i);
 	assert.match(help, /hub: print the systemd user unit/i);
 	await command.handler("unknown", context.ctx);
@@ -232,7 +226,7 @@ test("menu secondary screens return with stable selection and no server side eff
 				selector.handleInput("\u001b[B");
 				selector.handleInput("\r");
 			} else if (customCalls === 2) {
-				assert.match(selector.render().join("\n"), /Image limits/);
+				assert.match(selector.render().join("\n"), /hub|settings/i);
 				selector.handleInput("tui.select.cancel");
 			} else {
 				assert.match(selector.render().join("\n"), /Effect: Review effective startup/);
@@ -481,10 +475,7 @@ test("settings changes save in action order and update effective status", async 
 		mode: "tui",
 		custom: async (factory: unknown) => {
 			const selector = createCustomSelectorHarness(factory);
-			assert.doesNotMatch(
-				selector.render().join("\n"),
-				/maxImages|maxImageBytes|maxBatchBytes|maxImagePixels/,
-			);
+			assert.match(selector.render().join("\n"), /Pi WebUI|WebUI|Start|hub/i);
 			settingsScreens += 1;
 			if (settingsScreens === 1) {
 				selector.handleInput("\r");

@@ -6,11 +6,13 @@
 
 在浏览器里查看你终端中正在运行的那个 Pi 会话，并且让所有 Pi 会话共用一个固定端口。
 
-本项目是对 [`narumiruna/pi-extensions/deprecated/pi-webui`](https://github.com/narumiruna/pi-extensions/tree/main/deprecated/pi-webui)（MIT，上游已归档）的移植，做了三处刻意的改动：
+本项目是对 [`narumiruna/pi-extensions/deprecated/pi-webui`](https://github.com/narumiruna/pi-extensions/tree/main/deprecated/pi-webui)（MIT，上游已归档）的移植，做了五处刻意的改动：
 
 1. **不提供鉴权。** 会话服务器与 Hub 都只监听回环地址，直接打开 `http://127.0.0.1:43118/` 就能用。远程访问由使用者自己解决 —— 在 Hub 前面加上你自己的访问控制（例如 Cloudflare Zero Trust）。
 2. **所有会话共用一个固定端口。** Hub 持有该端口，用 `/?session=<sessionId>` 这种和 `agegr/pi-web` 一致的地址寻址会话；每个 Pi 会话只向 Hub 保持一条 WebSocket，Pi 进程内不再监听任何端口。
 3. **Hub 只做转发，绝不承载 agent。** Hub 不会打开、读取或写入任何 Pi 会话，它只在浏览器与已注册的会话之间转发 HTTP 与 Server-Sent Events。
+4. **界面改动只需重启 Hub。** 页面与打包产物由 Hub 提供，改界面不用逐个重载 Pi 会话。
+5. **页面就是 agegr/pi-web 自己的前端，逐字节复制。** 组件、样式、侧栏、面板以及它们调用的 API 路由都来自上游，所以你看到的是那个界面本身，而不是仿制品；`src/web/pi-web/PORTING.md` 说明了如何保持副本同步。
 
 ## 为什么这种设计不会和终端打架
 
@@ -18,17 +20,17 @@
 
 pi-webui 从结构上避开了这一整类问题：
 
-- HTTP 服务器**跑在 Pi 进程内部**（`server.listen(0, "127.0.0.1")`），每个会话一个。
+- 每个会话的 API 都由**它自己所在的 Pi 进程**应答：Hub 通过该会话的 WebSocket 把浏览器的请求转发进去，Pi 进程不再监听任何端口。
 - 浏览器输入走 Pi 正常的输入通路（`pi.sendUserMessage(content, { deliverAs })`），与终端打字完全同级，因此终端和浏览器共享同一个 runtime、同一棵会话树、同一个写入者。
 - 会话落盘由 Pi 内核负责；pi-webui 从不写会话文件。
 - Hub 只做路由：它持有一份在线会话注册表、一个索引页和一套反向代理。
 
-代价是功能范围：一个页面只对应一个会话，没有会话管理器、没有 shell、文件浏览器、git 界面和任务看板；页面也只在那个 Pi 会话存活期间可用。
+页面本身就是上游的：会话侧栏、聊天界面、文件浏览器与查看器、git 状态与 diff、技能、模型、插件、MCP 与设置，全部由从上游复制的路由在本机上应答。刻意不做的，是需要第二个 agent 进程的事情：从浏览器新建会话、fork 一个没在运行的会话、以及终端面板。页面只在该 Pi 会话存活期间可用。
 
 ## 环境要求
 
 - **Node.js ≥ 22.18**（Hub 用 `bin/pi-webui-hub.mjs` 通过 Node 内置的类型擦除直接加载 TypeScript 源码，所以没有构建步骤）。实际测试环境是 Node 24/26。
-- Pi Coding Agent；如果你要用图片流水线里的可选格式（PNG/JPEG/WebP/GIF/BMP/TIFF/HEIF/AVIF 由 sharp 处理），运行扩展的会话里需要有 `git`。
+- Pi Coding Agent；扩展本身除 Node 与 Pi 之外不需要别的依赖。
 
 ## 安装
 
@@ -94,7 +96,7 @@ npm run hub            # 或者：pi-webui-hub --port 43118
 | `/webui` | 当前状态菜单（打开、设置、状态、帮助） |
 | `/webui open` | 把当前会话发布到 Hub，并打印它的链接 |
 | `/webui hub` | 打印 systemd unit 与安装步骤 |
-| `/webui status` | 服务器、Hub、链接、启动方式、图片上限、设置文件路径 |
+| `/webui status` | 服务器、Hub、链接、启动方式、设置文件路径 |
 | `/webui settings` | TUI 设置界面（对外只暴露 `startOnSessionStart` 一个开关） |
 | `/webui init` | 创建默认配置文件，绝不覆盖已有内容 |
 | `/webui help` | 命令与设置说明 |
@@ -130,11 +132,6 @@ $PI_CODING_AGENT_DIR/pi-webui.json      # 未设置时是 ~/.pi/agent/pi-webui.j
 ```json
 {
   "startOnSessionStart": false,
-  "retainSentImages": false,
-  "maxImages": 8,
-  "maxImageBytes": 10485760,
-  "maxBatchBytes": 41943040,
-  "maxImagePixels": 50000000,
   "hub": {
     "port": 43118,
     "allowedHosts": ["pi.example.com"]

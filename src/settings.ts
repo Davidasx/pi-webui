@@ -4,23 +4,15 @@ import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import lockfile from "proper-lockfile";
 import { CONFIG_FILE_NAME, DEFAULT_HUB_PORT } from "./hub-protocol.js";
-import {
-	DEFAULT_IMAGE_LIMITS,
-	IMAGE_HARD_LIMITS,
-	type ImageLimits,
-	imageLimits,
-} from "./image-limits.js";
+
 
 /** The configuration file name is owned by the shared contract; both readers resolve it the same way. */
 export const SETTINGS_FILE = CONFIG_FILE_NAME;
 
-const MIB = 1024 * 1024;
+const _MIB = 1024 * 1024;
 
-export interface WebUISettings extends ImageLimits {
+export interface WebUISettings {
 	startOnSessionStart: boolean;
-	retainSentImages: boolean;
-	maxRetainedImages: number;
-	maxRetainedBytes: number;
 	/** Hub listen port, written to the `hub` object of the same file. */
 	hubPort: number;
 	/** Extra allowed `Host` names (a tunnel or reverse proxy in front of the hub). */
@@ -29,17 +21,8 @@ export interface WebUISettings extends ImageLimits {
 
 export const DEFAULT_SETTINGS: Readonly<WebUISettings> = Object.freeze({
 	startOnSessionStart: false,
-	retainSentImages: false,
-	maxRetainedImages: 32,
-	maxRetainedBytes: 128 * MIB,
 	hubPort: DEFAULT_HUB_PORT,
 	hubAllowedHosts: [],
-	...DEFAULT_IMAGE_LIMITS,
-});
-
-export const RETENTION_HARD_LIMITS = Object.freeze({
-	maxRetainedImages: 128,
-	maxRetainedBytes: 512 * MIB,
 });
 
 export interface SettingsLoadResult {
@@ -83,31 +66,8 @@ export function settingsFilePath(): string {
 
 export function normalizeSettings(value: unknown): WebUISettings | undefined {
 	if (!isRecord(value)) return undefined;
-	if (
-		(Object.hasOwn(value, "startOnSessionStart") &&
-			typeof value.startOnSessionStart !== "boolean") ||
-		(Object.hasOwn(value, "retainSentImages") && typeof value.retainSentImages !== "boolean")
-	) {
+	if (Object.hasOwn(value, "startOnSessionStart") && typeof value.startOnSessionStart !== "boolean") {
 		return undefined;
-	}
-	for (const [key, maximum] of [
-		["maxRetainedImages", RETENTION_HARD_LIMITS.maxRetainedImages],
-		["maxRetainedBytes", RETENTION_HARD_LIMITS.maxRetainedBytes],
-		["maxImages", IMAGE_HARD_LIMITS.maxImages],
-		["maxImageBytes", IMAGE_HARD_LIMITS.maxImageBytes],
-		["maxBatchBytes", IMAGE_HARD_LIMITS.maxBatchBytes],
-		["maxImagePixels", IMAGE_HARD_LIMITS.maxImagePixels],
-	] as const) {
-		if (!Object.hasOwn(value, key)) continue;
-		const candidate = value[key];
-		if (
-			typeof candidate !== "number" ||
-			!Number.isSafeInteger(candidate) ||
-			candidate <= 0 ||
-			candidate > maximum
-		) {
-			return undefined;
-		}
 	}
 	const hub = value.hub;
 	if (hub !== undefined && !isRecord(hub)) return undefined;
@@ -130,39 +90,11 @@ export function normalizeSettings(value: unknown): WebUISettings | undefined {
 			typeof value.startOnSessionStart === "boolean"
 				? value.startOnSessionStart
 				: DEFAULT_SETTINGS.startOnSessionStart,
-		retainSentImages:
-			typeof value.retainSentImages === "boolean"
-				? value.retainSentImages
-				: DEFAULT_SETTINGS.retainSentImages,
-		maxRetainedImages:
-			typeof value.maxRetainedImages === "number"
-				? value.maxRetainedImages
-				: DEFAULT_SETTINGS.maxRetainedImages,
-		maxRetainedBytes:
-			typeof value.maxRetainedBytes === "number"
-				? value.maxRetainedBytes
-				: DEFAULT_SETTINGS.maxRetainedBytes,
-		...imageLimits({
-			maxImages: typeof value.maxImages === "number" ? value.maxImages : DEFAULT_SETTINGS.maxImages,
-			maxImageBytes:
-				typeof value.maxImageBytes === "number"
-					? value.maxImageBytes
-					: DEFAULT_SETTINGS.maxImageBytes,
-			maxBatchBytes:
-				typeof value.maxBatchBytes === "number"
-					? value.maxBatchBytes
-					: DEFAULT_SETTINGS.maxBatchBytes,
-			maxImagePixels:
-				typeof value.maxImagePixels === "number"
-					? value.maxImagePixels
-					: DEFAULT_SETTINGS.maxImagePixels,
-		}),
 		hubPort: typeof hubPort === "number" ? hubPort : DEFAULT_SETTINGS.hubPort,
 		hubAllowedHosts: Array.isArray(hubAllowedHosts)
 			? hubAllowedHosts.map((host) => (host as string).trim().toLowerCase())
 			: [...DEFAULT_SETTINGS.hubAllowedHosts],
 	};
-	if (normalized.maxImageBytes > normalized.maxBatchBytes) return undefined;
 	return normalized;
 }
 
@@ -191,14 +123,12 @@ export async function loadSettings(path = settingsFilePath()): Promise<SettingsL
 		if (!isRecord(document)) return invalid(path, "the top level must be a JSON object");
 		const settings = normalizeSettings(document);
 		if (!settings) return invalid(path, "recognized settings have an invalid type or limit");
-		const warning = elevatedLimitWarning(settings);
 		return {
 			kind: "loaded",
 			path,
 			settings,
 			source: "settings file",
 			document,
-			...(warning ? { warning } : {}),
 		};
 	} catch (error) {
 		return invalid(path, formatError(error));
@@ -356,14 +286,6 @@ async function pathEntryExists(path: string): Promise<boolean> {
 		if (isNodeError(error) && error.code === "ENOENT") return false;
 		throw error;
 	}
-}
-
-function elevatedLimitWarning(settings: WebUISettings): string | undefined {
-	const elevated = (Object.keys(DEFAULT_IMAGE_LIMITS) as Array<keyof ImageLimits>).filter(
-		(key) => settings[key] > DEFAULT_IMAGE_LIMITS[key],
-	);
-	if (elevated.length === 0) return undefined;
-	return `${SETTINGS_FILE} uses image limits above safe defaults: ${elevated.join(", ")}. Higher limits increase Pi-process memory and processing cost.`;
 }
 
 function invalid(path: string, reason: string): SettingsLoadResult {

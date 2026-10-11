@@ -1,0 +1,86 @@
+/*
+ * The page shell around their chat surface: a thin top bar, and the height rules their transcript
+ * and composer expect (their layout fills its parent).
+ */
+
+:root {
+	--shell-header-height: 3.2rem;
+}
+
+body {
+	margin: 0;
+}
+
+.shell {
+	display: flex;
+	flex-direction: column;
+	height: 100vh;
+	min-height: 0;
+}
+
+.shell-header {
+	align-items: center;
+	background: var(--bg, #fff);
+	border-bottom: 1px solid var(--border, #e0e0e0);
+	display: flex;
+	flex: 0 0 auto;
+	gap: 1rem;
+	justify-content: space-between;
+	padding: 0.5rem 1rem;
+}
+
+.shell-identity {
+	align-items: baseline;
+	display: flex;
+	gap: 0.6rem;
+	min-width: 0;
+}
+
+.shell-eyebrow {
+	color: var(--text-dim, #5e6673);
+	font-size: 10px;
+	font-weight: 700;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+}
+
+.shell-identity h1 {
+	font-size: 15px;
+	margin: 0;
+}
+
+.shell-session {
+	color: var(--text-dim, #5e6673);
+	font-size: 12px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.shell-link {
+	color: var(--accent, #245bce);
+	font-size: 12px;
+	text-decoration: none;
+}
+
+.shell-link:hover {
+	text-decoration: underline;
+}
+
+.shell-main {
+	display: flex;
+	flex: 1 1 auto;
+	min-height: 0;
+}
+
+.shell-main > * {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.shell-loading,
+.shell-error {
+	color: var(--text-dim, #5e6673);
+	font-size: 13px;
+	margin: 2rem auto;
+}

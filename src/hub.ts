@@ -31,6 +31,7 @@ import {
 	type HubSessionInfo,
 	type HubToExtensionMessage,
 	readHubConfig,
+	SESSION_API_PREFIX,
 	SESSION_PATH_PREFIX,
 	SESSIONS_PATH,
 	sessionApiTarget,
@@ -49,6 +50,14 @@ const CHANNEL_SILENCE_MS = 50_000;
 /** How long a disconnected session stays listed, so a browser keeps its context across a restart. */
 const SESSION_GRACE_MS = 30_000;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
+
+/**
+ * Paths that sit under the same prefixes as a session id but name one of their own routes
+ * (`/api/sessions/ui-state`, `/api/agent/running`, …). They must not be read as a session id: doing
+ * so sent them to a session that never exists, whose reply was our HTML page where their frontend
+ * expected JSON. `test/hub.test.ts` keeps this list equal to the static routes they ship.
+ */
+const PI_WEB_STATIC_SEGMENTS = new Set(["search", "ui-state", "new", "running"]);
 const MAX_TUNNEL_BYTES = 64 * 1024 * 1024;
 const MAX_SESSIONS = 128;
 /** Headers that describe the hop, not the request: never forwarded to a session. */
@@ -231,6 +240,36 @@ function parseSessionInfo(source: Record<string, unknown>): HubSessionInfo | und
 	};
 }
 
+/**
+ * Their paths: `/api/agent/<id>/…`, `/api/sessions/<id>/…`, and the id-less ones the hub answers.
+ * Returns the session the request names, or null when the path is not theirs.
+ */
+function piWebTarget(pathname: string): { sessionId?: string } | null {
+	// `/api/session/<id>/…` is the hub's own prefix for a session's API: it is rewritten to the
+	// session's path below, so it must not be read as one of their `/api/**` routes here.
+	if (pathname.startsWith(SESSION_API_PREFIX)) return null;
+	// `sessions/<x>` is a session only when `<x>` looks like one. Their own routes also live under
+	// these prefixes — `sessions/ui-state`, `agent/running`, `agent/new` — and treating those as
+	// session ids sent them to a session that cannot exist, which answered with our HTML page where
+	// their browser expected JSON.
+	const agent = /^\/api\/agent\/([^/]+)(?:\/|$)/.exec(pathname);
+	const agentId = agent ? decodeURIComponent(agent[1]) : undefined;
+	if (agentId && SESSION_ID_PATTERN.test(agentId) && !PI_WEB_STATIC_SEGMENTS.has(agentId)) {
+		return { sessionId: agentId };
+	}
+	const sessions_ = /^\/api\/sessions\/([^/]+)(?:\/|$)/.exec(pathname);
+	const sessionSegment = sessions_ ? decodeURIComponent(sessions_[1]) : undefined;
+	if (sessionSegment && SESSION_ID_PATTERN.test(sessionSegment) && !PI_WEB_STATIC_SEGMENTS.has(sessionSegment)) {
+		return { sessionId: sessionSegment };
+	}
+	// Every other `/api/**` path is one of the routes a session serves: their frontend asks for
+	// files, git, skills, plugins, MCP, models-config and more, and each of those runs inside a
+	// session. A path that names a session goes to that session; the rest go to the newest one,
+	// which is the session a browser tab is looking at.
+	if (pathname.startsWith("/api/")) return {};
+	return null;
+}
+
 function sessionIdFromPath(pathname: string): { sessionId: string; rest: string } | undefined {
 	if (!pathname.startsWith(SESSION_PATH_PREFIX)) return undefined;
 	const remainder = pathname.slice(SESSION_PATH_PREFIX.length);
@@ -240,191 +279,9 @@ function sessionIdFromPath(pathname: string): { sessionId: string; rest: string 
 	return { sessionId, rest: slash === -1 ? "/" : remainder.slice(slash) };
 }
 
-function formatAge(seconds: number): string {
-	if (seconds < 60) return `${Math.max(0, Math.round(seconds))}s ago`;
-	const minutes = Math.floor(seconds / 60);
-	if (minutes < 60) return `${minutes}m ago`;
-	return `${Math.floor(minutes / 60)}h ${minutes % 60}m ago`;
-}
 
-function formatDuration(seconds: number): string {
-	const total = Math.max(0, Math.round(seconds));
-	const minutes = Math.floor(total / 60);
-	if (minutes < 60) return `${minutes}m ${String(total % 60).padStart(2, "0")}s`;
-	return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
-}
 
-function sessionRowHtml(session: HubSessionSummary, now: number): string {
-	const title = session.name ?? session.projectName ?? session.sessionId.slice(0, 8);
-	const statusClass = session.stale ? "stale" : session.activity === "running" ? "busy" : "idle";
-	const statusText = session.stale ? "stale" : session.activity === "running" ? "running" : "idle";
-	return `<li data-session="${htmlEscape(session.sessionId)}" data-registered="${session.registeredAt}" data-seen="${session.lastSeen}">
-	<a class="card" href="${htmlEscape(session.url)}">
-		<span class="head"><span class="title">${htmlEscape(title)}</span><span class="state ${statusClass}">${statusText}</span></span>
-		<span class="meta">${htmlEscape(session.projectName ?? "Pi session")}${
-			session.model ? ` &middot; ${htmlEscape(session.model)}` : ""
-		}</span>
-		<span class="meta dim"><span class="uptime">up ${formatDuration((now - session.registeredAt) / 1000)}</span> &middot; seen <span class="age">${formatAge(
-			(now - session.lastSeen) / 1000,
-		)}</span> &middot; <code>${htmlEscape(session.sessionId.slice(0, 8))}</code></span>
-		<span class="meta dim path">${htmlEscape(session.cwd ?? "")}</span>
-	</a>
-</li>`;
-}
 
-function landingPage(sessions: readonly HubSessionSummary[], port: number, nonce: string): string {
-	const now = Date.now();
-	const rows = sessions.map((session) => sessionRowHtml(session, now)).join("\n");
-	const list = sessions.length ? `<ul class="sessions" id="sessions">\n${rows}\n</ul>` : `<ul class="sessions" id="sessions"></ul>`;
-	// Server-rendered rows mean the page is useful without JavaScript; the script only refreshes
-	// the list in place from the hub's event stream, so scrolling and focus survive updates.
-	const script = `(() => {
-	const list = document.getElementById("sessions");
-	const empty = document.getElementById("empty");
-	const status = document.getElementById("hub-status");
-	let sessions = ${JSON.stringify(sessions)};
-	const seconds = (value) => Math.max(0, Math.round(value));
-	const duration = (value) => {
-		const total = seconds(value);
-		const minutes = Math.floor(total / 60);
-		if (minutes < 60) return minutes + "m " + String(total % 60).padStart(2, "0") + "s";
-		return Math.floor(minutes / 60) + "h " + String(minutes % 60).padStart(2, "0") + "m";
-	};
-	const ago = (value) => {
-		const total = seconds(value);
-		if (total < 60) return total + "s ago";
-		const minutes = Math.floor(total / 60);
-		if (minutes < 60) return minutes + "m ago";
-		return Math.floor(minutes / 60) + "h " + (minutes % 60) + "m ago";
-	};
-	const element = (tag, className, text) => {
-		const node = document.createElement(tag);
-		if (className) node.className = className;
-		if (text !== undefined) node.textContent = text;
-		return node;
-	};
-	const render = () => {
-		list.textContent = "";
-		empty.hidden = sessions.length > 0;
-		const now = Date.now();
-		for (const session of sessions) {
-			const statusClass = session.stale ? "stale" : session.activity === "running" ? "busy" : "idle";
-			const statusText = session.stale ? "stale" : session.activity === "running" ? "running" : "idle";
-			const head = element("span", "head");
-			head.append(
-				element("span", "title", session.name || session.projectName || session.sessionId.slice(0, 8)),
-				element("span", "state " + statusClass, statusText),
-			);
-			const meta = element("span", "meta", (session.projectName || "Pi session") + (session.model ? " · " + session.model : ""));
-			const meta2 = element("span", "meta dim");
-			const uptime = element("span", "uptime", "up " + duration((now - session.registeredAt) / 1000));
-			const age = element("span", "age", ago((now - session.lastSeen) / 1000));
-			meta2.append(uptime, document.createTextNode(" · seen "), age, document.createTextNode(" · "), element("code", "", session.sessionId.slice(0, 8)));
-			const card = element("a", "card");
-			card.href = session.url;
-			card.append(head, meta, meta2, element("span", "meta dim path", session.cwd || ""));
-			const item = element("li");
-			item.append(card);
-			list.append(item);
-		}
-	};
-	const refreshAges = () => {
-		const now = Date.now();
-		for (const session of sessions) {
-			const item = list.querySelector('li[data-session="' + session.sessionId + '"]');
-			if (!item) continue;
-			const uptime = item.querySelector(".uptime");
-			const age = item.querySelector(".age");
-			if (uptime) uptime.textContent = "up " + duration((now - session.registeredAt) / 1000);
-			if (age) age.textContent = ago((now - session.lastSeen) / 1000);
-		}
-	};
-	// The stream is the fast path, but a proxy in front of the hub may buffer it (Cloudflare does
-	// under load) or cut it while idle. Track when data last arrived and fall back to plain polling,
-	// so the list is never silently stale.
-	let lastEventAt = Date.now();
-	const STALL_MS = 8000;
-	const refresh = async () => {
-		try {
-			const response = await fetch("/_hub/sessions", { cache: "no-store" });
-			const payload = await response.json();
-			sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
-			render();
-		} catch {
-			status.textContent = "offline";
-		}
-	};
-	const events = new EventSource("/_hub/events");
-	events.addEventListener("sessions", (event) => {
-		lastEventAt = Date.now();
-		sessions = JSON.parse(event.data);
-		status.textContent = "live";
-		render();
-	});
-	events.addEventListener("open", () => {
-		status.textContent = "live";
-	});
-	events.addEventListener("error", () => {
-		status.textContent = "reconnecting";
-	});
-	setInterval(() => {
-		if (Date.now() - lastEventAt > STALL_MS) {
-			status.textContent = "polling";
-			void refresh();
-		}
-	}, 3000);
-	setInterval(refreshAges, 1000);
-	render();
-})();`;
-	return `<!doctype html>
-<html lang="en">
-	<head>
-		<meta charset="utf-8" />
-		<meta name="viewport" content="width=device-width, initial-scale=1" />
-		<meta name="color-scheme" content="light dark" />
-		<title>pi-webui</title>
-		<style nonce="${nonce}">
-			:root { color-scheme: light dark; --fg: #111; --dim: #666; --bg: #fff; --card: #f5f5f5; --line: #e0e0e0; }
-			@media (prefers-color-scheme: dark) {
-				:root { --fg: #e8e8e8; --dim: #9a9a9a; --bg: #16181c; --card: #202329; --line: #333842; }
-			}
-			* { box-sizing: border-box; }
-			body { margin: 0 auto; max-width: 52rem; padding: 2rem 1.25rem 4rem; background: var(--bg); color: var(--fg);
-				font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
-			h1 { font-size: 1.35rem; margin: 0 0 .25rem; }
-			.sub { color: var(--dim); margin: 0 0 1.75rem; font-size: .9rem; }
-			#hub-status { text-transform: uppercase; letter-spacing: .04em; font-size: .72rem; }
-			ul.sessions { list-style: none; margin: 0; padding: 0; display: grid; gap: .75rem; }
-			a.card { display: flex; flex-direction: column; gap: .15rem; padding: .85rem 1rem; text-decoration: none;
-				color: inherit; background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
-			a.card:hover { border-color: var(--fg); }
-			.head { display: flex; align-items: center; gap: .5rem; }
-			.title { font-weight: 600; }
-			.meta { color: var(--dim); font-size: .85rem; }
-			.path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .78rem; word-break: break-all; }
-			.state { font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; padding: .1rem .4rem;
-				border-radius: 999px; border: 1px solid var(--line); }
-			.state.busy { color: #0a7; border-color: #0a7; }
-			.state.idle { color: #888; }
-			.state.stale { color: #c60; border-color: #c60; }
-			.empty { color: var(--dim); }
-			footer { margin-top: 2.5rem; color: var(--dim); font-size: .8rem; }
-			code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-		</style>
-	</head>
-	<body>
-		<h1>pi-webui</h1>
-		<p class="sub">Live browser companions for Pi sessions on this machine &middot; hub on port ${port} &middot; <span id="hub-status">connecting</span></p>
-		${list}
-		<p class="empty" id="empty"${sessions.length ? " hidden" : ""}>No Pi session is connected yet. Run Pi in a terminal and use <code>/webui open</code> (or enable "Start WebUI automatically") in the session you want to reach.</p>
-		<footer>This hub only routes requests to the Pi session that owns each page. It has no
-		authentication of its own: keep it on loopback, and put your own access control in front
-		of it (for example a reverse proxy with Cloudflare Zero Trust) before exposing it.</footer>
-		<script nonce="${nonce}">${script}</script>
-	</body>
-</html>
-`;
-}
 
 function sessionGonePage(sessionId: string, nonce: string): string {
 	return `<!doctype html>
@@ -581,18 +438,27 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 
 		const nonce = randomBytes(16).toString("base64url");
 		if (pathname === "/" || pathname === "/index.html") {
-			// One page for everything: without `?session=` it lists sessions, with it, it is that
-			// session's chat page. The bundle below is shared by all of them.
+			// The app itself is the front page, as it is on agegr/pi-web's own server: the session
+			// list lives in its sidebar, so there is no separate picker page to land on. Without
+			// `?session=` the newest connected session is named, and their sidebar switches from
+			// there; with it, the page is that session's.
 			const selected = url.searchParams.get("session");
-			if (selected && SESSION_ID_PATTERN.test(selected)) {
-				if (!sessions.has(selected)) {
-					sendHtml(response, 404, sessionGonePage(selected, nonce), nonce);
-					return;
-				}
+			const known = selected && SESSION_ID_PATTERN.test(selected) ? selected : undefined;
+			if (known && sessions.has(known)) {
 				await sendShell(response);
 				return;
 			}
-			sendHtml(response, 200, landingPage(listSessions(), serverPort(), nonce), nonce);
+			// No session in the URL (or one that is gone): their front page is still the app, and it
+			// needs a session to show, so send the browser to the newest connected one. The session
+			// list is in the app's own sidebar, which is where a user chooses from here.
+			const fallback = known ? undefined : latestSessionId();
+			if (fallback) {
+				response.writeHead(302, { Location: `/?session=${encodeURIComponent(fallback)}` }).end();
+				return;
+			}
+			// Nothing is connected: the app comes up empty rather than as a dead-end page, and its
+			// requests answer 503 the way a missing session should.
+			await sendShell(response);
 			return;
 		}
 		if ((method === "GET" || method === "HEAD") && (pathname === "/app.js" || pathname === "/app.css")) {
@@ -601,6 +467,22 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 		}
 		if (pathname === "/favicon.ico") {
 			response.writeHead(204).end();
+			return;
+		}
+
+		// agegr/pi-web's frontend speaks these paths; route each one to the session it names.
+		const piWeb = piWebTarget(pathname);
+		if (piWeb) {
+			const target = piWeb.sessionId ?? latestSessionId();
+			if (!target) {
+				sendJson(response, 503, { error: "No Pi session is connected" });
+				return;
+			}
+			if (!sessions.has(target)) {
+				sendHtml(response, 404, sessionGonePage(target, nonce), nonce);
+				return;
+			}
+			await tunnel({ sessionId: target, rest: pathname }, request, response, url.search, method);
 			return;
 		}
 
@@ -700,7 +582,11 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 			"Content-Type": "text/html; charset=utf-8",
 			"Content-Length": Buffer.byteLength(body),
 			"Cache-Control": "no-store",
-			"Content-Security-Policy": `default-src 'none'; style-src 'self' 'nonce-${nonce}'; script-src 'self' 'nonce-${nonce}'; img-src 'self' data: blob:; connect-src 'self'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'`,
+			// The page's own components inject inline `<style>` blocks (their panels style
+			// themselves that way), and a nonce in `style-src` makes the browser ignore
+			// `'unsafe-inline'`, so those blocks were dropped and the panels rendered as bare text.
+			// Styles are not executable; the script policy stays nonce-locked.
+			"Content-Security-Policy": `default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'nonce-${nonce}'; img-src 'self' data: blob:; connect-src 'self'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'`,
 			...PAGE_SECURITY_HEADERS,
 		});
 		response.end(body);
@@ -1007,6 +893,11 @@ export async function startHub(options: HubOptions = {}): Promise<Hub> {
 			}
 			if (!client.write(payload)) eventClients.delete(client);
 		}
+	}
+
+	/** The most recently active session, used by their id-less endpoints (models, list). */
+	function latestSessionId(): string | undefined {
+		return listSessions()[0]?.sessionId;
 	}
 
 	function serverPort(): number {

@@ -1,20 +1,6 @@
-import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
-import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
-import type {
-	ContextUsage,
-	ExtensionAPI,
-	ExtensionCommandContext,
-	ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
-import type { PreparedAttachment } from "./attachments.js";
-import {
-	ConversationProjection,
-	type PublicCommand,
-	projectBranchMessages,
-	type SessionControls,
-} from "./conversation.js";
 import { HubChannel, type HubChannelOptions } from "./hub-channel.js";
 import { HUB_UNIT_NAME, hubInstallSteps, packageVersion, renderHubUnit } from "./hub-install.js";
 import {
@@ -27,20 +13,8 @@ import {
 	hubBaseUrl,
 	readHubConfig,
 } from "./hub-protocol.js";
-import { DEFAULT_IMAGE_LIMITS, type ImageLimits, imageLimits } from "./image-limits.js";
-import {
-	type BrowserImageInput,
-	type ProcessBrowserImageOptions,
-	type ProcessedBrowserImage,
-	processBrowserImages,
-	processStagedImage,
-	validateStagedBrowserImages,
-} from "./images.js";
 import { safeTerminalText, type WebUIMenuState, webUIMenuItems, webUIMenuTitle } from "./menu.js";
-import { type EffectivePiImageSettings, readEffectivePiImageSettings } from "./pi-settings.js";
 import {
-	type WebSendRequest,
-	type WebSendResult,
 	WebUIServer,
 	type WebUIServerOptions,
 } from "./server.js";
@@ -52,6 +26,12 @@ import {
 	saveSettings,
 	type WebUISettings,
 } from "./settings.js";
+import { toClientAgentEvent } from "./web/pi-web/lib/agent-event-wire.js";
+import { type LiveSession, setLiveSession } from "./web/pi-web/lib/rpc-manager.js";
+import { invalidateSessionListCache } from "./web/pi-web/lib/session-reader.js";
+import { computeSessionStats } from "./web/pi-web/lib/session-stats.js";
+import { generateSessionTitle } from "./web/pi-web/lib/session-title.js";
+import type { SessionEntry } from "./web/pi-web/lib/types.js";
 
 const WIDGET_KEY = "webui";
 const ACTIVITY_STATUS_KEY = "webui:activity";
@@ -130,15 +110,6 @@ export interface RuntimeDependencies {
 	saveSettings: typeof saveSettings;
 	initializeSettings: typeof initializeSettings;
 	createService(options: WebUIServerOptions, origin: string): ServerControl | Promise<ServerControl>;
-	readPiSettings(cwd: string, projectTrusted: boolean): Promise<EffectivePiImageSettings>;
-	processImages(
-		inputs: BrowserImageInput[],
-		options?: ProcessBrowserImageOptions,
-	): Promise<ImageContent[]>;
-	processAttachment(
-		source: Uint8Array,
-		options?: ProcessBrowserImageOptions,
-	): Promise<ProcessedBrowserImage>;
 	createChannel(options: HubChannelOptions): HubChannel;
 }
 
@@ -147,16 +118,49 @@ const DEFAULT_DEPENDENCIES: RuntimeDependencies = {
 	saveSettings,
 	initializeSettings,
 	createService: (options, origin) => WebUIServer.create(options, origin),
-	readPiSettings: readEffectivePiImageSettings,
-	processImages: processBrowserImages,
-	processAttachment: processStagedImage,
 	createChannel: (options) => new HubChannel(options),
 };
+
+/** Their composed images, as Pi's image content blocks. */
+function browserPromptImages(value: unknown): Array<{ type: "image"; data: string; mimeType: string }> {
+	if (!Array.isArray(value)) return [];
+	const images: Array<{ type: "image"; data: string; mimeType: string }> = [];
+	for (const entry of value) {
+		if (!isRecord(entry)) continue;
+		const data = entry.data;
+		const mimeType = entry.mimeType;
+		if (typeof data === "string" && typeof mimeType === "string" && data.length > 0) {
+			images.push({ type: "image", data, mimeType });
+		}
+	}
+	return images;
+}
+
+/** The text of a message's content, whether it is one string or content blocks. */
+function textOf(content: unknown): string {
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((block): block is { type: "text"; text: string } => {
+			return typeof block === "object" && block !== null && (block as { type?: string }).type === "text";
+		})
+		.map((block) => block.text)
+		.join("\n");
+}
+
+/** One line of a message, short enough to be a session name. */
+function firstLine(text: string): string {
+	const flat = text.replace(/\s+/g, " ").trim();
+	if (flat.length <= SESSION_NAME_MAX_LENGTH) return flat;
+	return `${flat.slice(0, SESSION_NAME_MAX_LENGTH - 1).trimEnd()}\u2026`;
+}
+
+const SESSION_NAME_MAX_LENGTH = 72;
 
 export class WebUIRuntime {
 	private readonly dependencies: RuntimeDependencies;
 	private context?: ExtensionContext;
-	private conversation?: ConversationProjection;
+	/** The command context Pi hands `/webui`, which is the only place tree navigation exists. */
+	private commandContext?: ExtensionCommandContext;
 	private server?: ServerControl;
 	private serverStarting?: Promise<ServerControl>;
 	private hub?: HubChannel;
@@ -164,14 +168,16 @@ export class WebUIRuntime {
 	private sessionAbort = new AbortController();
 	private generation = 0;
 	private closed = true;
-	private lastSettingsWarning = "";
-	private nextLiveMessageId = 0;
+	/** Whether a run is streaming right now, which their UI labels differently from a command run. */
+	private streaming = false;
+	private bashRunning = false;
+	private compacting = false;
 	private readonly activeMessageIds = new Map<string, string>();
 	private readonly finalMessageTimers = new Set<ReturnType<typeof setTimeout>>();
 	private readonly pendingBrowserInputs = new Map<string, PendingBrowserInput>();
 	private readonly acceptedBrowserInputs = new Map<string, AcceptedBrowserInput>();
+	private readonly piWebListeners = new Set<(event: unknown) => void>();
 	private settings: WebUISettings = { ...DEFAULT_SETTINGS };
-	private effectiveImageLimits: Readonly<ImageLimits> = DEFAULT_IMAGE_LIMITS;
 	private settingsDocument?: Record<string, unknown> = {};
 	private settingsPath = "pi-webui.json";
 	private settingsSource: SettingsLoadResult["source"] = "defaults";
@@ -196,6 +202,9 @@ export class WebUIRuntime {
 			},
 			handler: async (args, ctx) => {
 				this.context = ctx;
+				// Pi offers tree navigation (`ctx.navigateTree`) to a command handler only, and their
+				// branch navigation and "edit from here" both go through it.
+				this.commandContext = ctx;
 				const action = args.trim().toLowerCase();
 				try {
 					if (!action) {
@@ -244,25 +253,28 @@ export class WebUIRuntime {
 		this.pi.on("session_tree", async (_event, ctx) => {
 			this.captureContext(ctx);
 			this.cancelPendingMessages();
-			this.conversation?.replaceBranch(projectBranchMessages(ctx.sessionManager.getBranch()));
 		});
 		this.pi.on("session_info_changed", async (event, ctx) => {
 			this.captureContext(ctx);
-			this.conversation?.updateSession({ name: event.name });
 			this.publishSessionInfo();
+			this.emitPiWebEvent({ type: "session_info_changed", name: event.name });
 		});
 		this.pi.on("model_select", async (_event, ctx) => {
 			this.captureContext(ctx);
-			this.refreshControls(ctx);
 			this.publishSessionInfo();
 		});
-		this.pi.on("thinking_level_select", async (_event, ctx) => {
+		this.pi.on("thinking_level_select", async (event, ctx) => {
 			this.captureContext(ctx);
-			this.refreshControls(ctx);
+			if (isRecord(event)) this.emitPiWebEvent({ type: "thinking_level_changed", level: event.level });
+		});
+		this.pi.on("session_before_compact", async (_event, ctx) => {
+			this.captureContext(ctx);
+			this.compacting = true;
+			this.publishSessionInfo();
 		});
 		this.pi.on("session_compact", async (_event, ctx) => {
+			this.compacting = false;
 			this.captureContext(ctx);
-			this.refreshControls(ctx);
 		});
 		this.pi.on("input", (event) => {
 			if (event.source !== "extension") return;
@@ -279,20 +291,24 @@ export class WebUIRuntime {
 		});
 		this.pi.on("message_start", async (event, ctx) => {
 			this.captureContext(ctx);
-			this.recordMessage(
-				"start",
-				sanitizeBrowserMessageEvent(event, this.acceptedBrowserInputs, false),
-			);
+			this.streaming = true;
+			const started = sanitizeBrowserMessageEvent(event, this.acceptedBrowserInputs, false);
+			// Their client opens a streaming bubble from this snapshot and then applies deltas.
+			if (isRecord(started)) this.emitPiWebEvent({ ...started, type: "message_start" });
 		});
 		this.pi.on("message_update", async (event, ctx) => {
 			this.captureContext(ctx);
-			this.recordMessage("update", event);
+			this.streaming = true;
+			// Every delta reaches the browser, which is what makes the answer appear as it is written
+			// instead of all at once when the turn ends.
+			if (isRecord(event)) this.emitPiWebEvent({ ...event, type: "message_update" });
 		});
 		this.pi.on("message_end", async (event, ctx) => {
 			this.captureContext(ctx);
-			this.refreshControls(ctx);
+			if (isRecord(event) && isRecord(event.message)) {
+				this.emitPiWebEvent({ type: "message_end", message: event.message });
+			}
 			const sanitized = sanitizeBrowserMessageEvent(event, this.acceptedBrowserInputs, true);
-			this.recordMessage("end", sanitized);
 			// Pi applies this replacement before persistence and before the prompt reaches the model.
 			if (sanitized !== event && isRecord(sanitized) && isRecord(sanitized.message)) {
 				return { message: sanitized.message as unknown as typeof event.message };
@@ -300,41 +316,44 @@ export class WebUIRuntime {
 		});
 		this.pi.on("tool_execution_start", async (event, ctx) => {
 			this.captureContext(ctx);
-			this.recordTool("start", event);
+			if (isRecord(event) && event.toolName === "bash") this.bashRunning = true;
+			if (isRecord(event)) this.emitPiWebEvent({ ...event, type: "tool_execution_start" });
 		});
 		this.pi.on("tool_execution_update", async (event, ctx) => {
 			this.captureContext(ctx);
-			this.recordTool("update", event);
+			if (isRecord(event)) this.emitPiWebEvent({ ...event, type: "tool_execution_update" });
 		});
 		this.pi.on("tool_execution_end", async (event, ctx) => {
 			this.captureContext(ctx);
-			this.recordTool("end", event);
+			if (isRecord(event) && event.toolName === "bash") this.bashRunning = false;
+			if (isRecord(event)) this.emitPiWebEvent({ ...event, type: "tool_execution_end" });
 		});
 		this.pi.on("agent_start", async (_event, ctx) => {
 			this.captureContext(ctx);
-			this.conversation?.setActivity("running");
+			this.streaming = true;
 			this.publishSessionInfo();
+			this.emitPiWebEvent({ type: "agent_start" });
 		});
 		(this.pi as LatestExtensionAPI).on("agent_settled", async (_event, ctx) => {
 			this.captureContext(ctx);
-			this.refreshControls(ctx);
 			if (ctx.isIdle() && !ctx.hasPendingMessages()) {
+				this.streaming = false;
+				this.bashRunning = false;
 				this.acceptedBrowserInputs.clear();
-				this.conversation?.setActivity("idle");
 				this.publishSessionInfo();
+				this.emitPiWebEvent({ type: "agent_settled", aborted: false });
+				this.emitPiWebEvent({ type: "agent_end", messages: [], willRetry: false });
 			}
 		});
 	}
 
 	async start(ctx: ExtensionContext): Promise<void> {
 		const generation = ++this.generation;
-		const previousConversation = this.conversation;
 		this.closed = true;
 		this.sessionAbort.abort();
 		this.cancelPendingMessages();
 		this.cancelBrowserInputs("The Pi session changed before the browser prompt was accepted.");
 		this.acceptedBrowserInputs.clear();
-		previousConversation?.close();
 		await this.releaseServer();
 		if (generation !== this.generation) return;
 		await this.settingsSaveQueue;
@@ -344,21 +363,8 @@ export class WebUIRuntime {
 		this.applySettingsResult(settingsResult);
 		this.sessionAbort = new AbortController();
 		this.context = ctx;
-		this.conversation = new ConversationProjection(
-			{
-				id: ctx.sessionManager.getSessionId(),
-				cwd: ctx.cwd,
-				projectName: basename(ctx.cwd) || ctx.cwd,
-				...(ctx.sessionManager.getSessionName()
-					? { name: ctx.sessionManager.getSessionName() }
-					: {}),
-			},
-			projectBranchMessages(ctx.sessionManager.getBranch()),
-			undefined,
-			this.readControls(ctx),
-		);
 		this.closed = false;
-		this.lastSettingsWarning = "";
+		this.registerLiveSession();
 		ctx.ui.setWidget(WIDGET_KEY, undefined);
 		this.activityId += 1;
 		ctx.ui.setStatus(ACTIVITY_STATUS_KEY, undefined);
@@ -376,17 +382,16 @@ export class WebUIRuntime {
 	async shutdown(ctx: ExtensionContext): Promise<void> {
 		const generation = ++this.generation;
 		this.closed = true;
+		setLiveSession(undefined);
 		this.sessionAbort.abort();
 		this.cancelPendingMessages();
 		this.cancelBrowserInputs("The Pi session ended before the browser prompt was accepted.");
 		this.acceptedBrowserInputs.clear();
-		this.conversation?.close();
 		await this.settingsSaveQueue;
 		if (generation !== this.generation) return;
 		await this.releaseServer();
 		if (generation !== this.generation) return;
 		this.context = undefined;
-		this.conversation = undefined;
 		ctx.ui.setWidget(WIDGET_KEY, undefined);
 		this.activityId += 1;
 		ctx.ui.setStatus(ACTIVITY_STATUS_KEY, undefined);
@@ -396,45 +401,7 @@ export class WebUIRuntime {
 		if (!this.closed) this.context = ctx;
 	}
 
-	private recordMessage(phase: "start" | "update" | "end", event: unknown): void {
-		if (!isRecord(event) || !isRecord(event.message) || typeof event.message.role !== "string") {
-			return;
-		}
-		const key = messageLifecycleKey(event.message);
-		let id = this.activeMessageIds.get(key);
-		if (phase === "start" || !id) {
-			id = `web-live:${++this.nextLiveMessageId}`;
-			this.activeMessageIds.set(key, id);
-		}
-		const retainedImageIds = Array.isArray(event.retainedImageIds)
-			? event.retainedImageIds.filter((value): value is string => typeof value === "string")
-			: [];
-		if (phase !== "end") {
-			this.recordProjectedMessage(event.message, false, id, retainedImageIds);
-			return;
-		}
-		this.activeMessageIds.delete(key);
-		const generation = this.generation;
-		const timer = setTimeout(() => {
-			this.finalMessageTimers.delete(timer);
-			if (generation !== this.generation || this.closed) return;
-			this.recordProjectedMessage(event.message, true, id, retainedImageIds);
-		}, 0);
-		this.finalMessageTimers.add(timer);
-	}
 
-	private recordProjectedMessage(
-		message: unknown,
-		final: boolean,
-		id: string,
-		retainedImageIds: readonly string[] = [],
-	): void {
-		try {
-			this.conversation?.recordMessage(message, final, id, retainedImageIds);
-		} catch {
-			// Unknown custom message shapes do not block the supported transcript.
-		}
-	}
 
 	private cancelPendingMessages(): void {
 		this.activeMessageIds.clear();
@@ -442,24 +409,6 @@ export class WebUIRuntime {
 		this.finalMessageTimers.clear();
 	}
 
-	private recordTool(phase: "start" | "update" | "end", event: unknown): void {
-		if (
-			!isRecord(event) ||
-			typeof event.toolCallId !== "string" ||
-			typeof event.toolName !== "string"
-		)
-			return;
-		const result =
-			phase === "update" ? event.partialResult : phase === "end" ? event.result : undefined;
-		this.conversation?.recordTool(
-			phase,
-			event.toolCallId,
-			event.toolName,
-			event.args,
-			result,
-			typeof event.isError === "boolean" ? event.isError : undefined,
-		);
-	}
 
 	private async presentLink(ctx: ExtensionContext): Promise<void> {
 		const service = await this.ensureService();
@@ -719,7 +668,6 @@ export class WebUIRuntime {
 			...(this.hub?.sessionUrl() ? [`Link: ${this.hub.sessionUrl()}`] : []),
 			`Channel: ${safeTerminalText(this.hubStatus.channelUrl)}`,
 			`Startup: ${this.settings.startOnSessionStart ? "Every session" : "Manual"} (${source})`,
-			`Image limits (${source}): ${this.effectiveImageLimits.maxImages} images, ${formatMib(this.effectiveImageLimits.maxImageBytes)}/image, ${formatMib(this.effectiveImageLimits.maxBatchBytes)}/batch, ${this.effectiveImageLimits.maxImagePixels.toLocaleString("en-US")} pixels/image`,
 			`Settings: ${safeTerminalText(this.settingsPath)}`,
 		];
 	}
@@ -738,7 +686,7 @@ export class WebUIRuntime {
 			"settings: edit WebUI settings in TUI mode",
 			"status: show effective settings, source, path, hub state, and current server state",
 			"init: create the defaults file without overwriting existing content",
-			'Accepted JSON starts with { "startOnSessionStart": false } and may include advanced maxImages, maxImageBytes, maxBatchBytes, and maxImagePixels fields.',
+			'Accepted JSON starts with { "startOnSessionStart": false }; the hub port and allowed hosts live under "hub".',
 			`Settings path: ${safeTerminalText(this.settingsPath)}`,
 			"Image byte/pixel limits stay in Advanced JSON; Pi provider-ready dimension/Base64 limits are fixed.",
 			"Settings changes save immediately; startup changes apply on the next session initialization or reload.",
@@ -806,7 +754,6 @@ export class WebUIRuntime {
 
 	private applySettingsResult(result: SettingsLoadResult): void {
 		this.settings = { ...result.settings };
-		this.effectiveImageLimits = imageLimits(result.settings);
 		this.settingsDocument = result.kind === "invalid" ? undefined : { ...(result.document ?? {}) };
 		this.settingsPath = result.path;
 		this.settingsSource = result.source;
@@ -817,23 +764,20 @@ export class WebUIRuntime {
 	 * the hub is the only port on the machine.
 	 */
 	private async ensureService(): Promise<ServerControl> {
-		if (this.closed || !this.conversation) throw new Error("the Pi session is not ready");
+		if (this.closed) throw new Error("the Pi session is not ready");
 		if (this.server) return this.server;
 		if (!this.serverStarting) {
 			const generation = this.generation;
-			const conversation = this.conversation;
 			const starting = this.dependencies.createService(
 				{
-					conversation,
-					send: (request) => this.sendBrowserMessage(request, generation),
-					imageLimits: this.effectiveImageLimits,
-					sentImageSettings: {
-						enabled: this.settings.retainSentImages,
-						maxImages: this.settings.maxRetainedImages,
-						maxBytes: this.settings.maxRetainedBytes,
+					piWeb: {
+						sessionId: () => this.context?.sessionManager.getSessionId() ?? "",
+						autoName: (id) => this.piWebAutoName(id),
+						command: (command) => this.piWebCommand(command),
+						state: async () => this.piWebState(),
+						isRunning: () => !(this.context?.isIdle() ?? true),
+						subscribe: (listener) => this.subscribePiWebEvents(listener),
 					},
-					processAttachment: (source: Uint8Array, signal?: AbortSignal) =>
-						this.processStagedAttachment(source, generation, signal),
 					controls: {
 						models: async () => this.listSessionModels(),
 						setModel: (provider, id) => this.setSessionModel(provider, id, generation),
@@ -846,7 +790,7 @@ export class WebUIRuntime {
 				hubBaseUrl().replace(/\/+$/, ""),
 			);
 			this.serverStarting = Promise.resolve(starting).then(async (server) => {
-				if (generation !== this.generation || this.closed || conversation !== this.conversation) {
+				if (generation !== this.generation || this.closed) {
 					await server.close();
 					throw new Error("the Pi session changed while the server was starting");
 				}
@@ -862,214 +806,45 @@ export class WebUIRuntime {
 		}
 	}
 
-	private async processStagedAttachment(
-		source: Uint8Array,
-		generation: number,
-		signal?: AbortSignal,
-	): Promise<PreparedAttachment> {
-		const ctx = this.context;
-		if (!ctx || this.closed || generation !== this.generation) {
-			throw new Error("The Pi session has ended.");
-		}
-		const combinedSignal = signal
-			? AbortSignal.any([this.sessionAbort.signal, signal])
-			: this.sessionAbort.signal;
-		const settings = await this.dependencies.readPiSettings(ctx.cwd, ctx.isProjectTrusted());
-		this.notifySettingsWarnings(ctx, settings.warnings);
-		const image = await this.dependencies.processAttachment(source, {
-			maxImageBytes: this.effectiveImageLimits.maxImageBytes,
-			maxPixels: this.effectiveImageLimits.maxImagePixels,
-			autoResize: settings.autoResize,
-			blockImages: settings.blockImages,
-			supportsImages: ctx.model?.input.includes("image") ?? false,
-			signal: combinedSignal,
-		});
-		if (combinedSignal.aborted || generation !== this.generation || this.closed) {
-			throw new Error("Image processing was cancelled.");
-		}
-		return {
-			...image,
-			notes: attachmentNotes(image),
-		};
-	}
 
-	private async sendBrowserMessage(
-		request: WebSendRequest,
-		generation: number,
-	): Promise<WebSendResult> {
-		const ctx = this.context;
-		if (!ctx || this.closed || generation !== this.generation) {
-			throw new Error("The Pi session has ended.");
-		}
-
-		const signal = request.signal
-			? AbortSignal.any([this.sessionAbort.signal, request.signal])
-			: this.sessionAbort.signal;
-		if (signal.aborted) throw new Error("The browser message was cancelled.");
-		await this.preflightIdlePrompt(ctx, request, generation, signal);
-		let images: ImageContent[] = [];
-		if (request.images.length > 0) {
-			validateStagedBrowserImages(request.images, this.effectiveImageLimits);
-			const settings = await this.dependencies.readPiSettings(ctx.cwd, ctx.isProjectTrusted());
-			this.notifySettingsWarnings(ctx, settings.warnings);
-			if (settings.blockImages) throw new Error("Pi image sending is disabled.");
-			await this.validateCurrentModel(ctx, generation, signal, true);
-			images = request.images.map((image) => ({
-				type: "image" as const,
-				data: image.data,
-				mimeType: image.mimeType ?? "image/png",
-			}));
-		}
-		if (signal.aborted) throw new Error("The browser message was cancelled.");
-		if (!this.context || this.closed || generation !== this.generation) {
-			throw new Error("The Pi session changed while the message was being prepared.");
-		}
-
-		const text = request.text;
-		if (isSlashCommand(text)) {
-			if (request.images.length > 0 || (request.attachmentIds?.length ?? 0) > 0) {
-				throw new Error("Slash commands cannot be sent with images.");
-			}
-			const dispatched = await this.dispatchCommand(ctx, generation, text);
-			if (dispatched) return dispatched;
-		}
-		const content: string | Array<TextContent | ImageContent> =
-			images.length === 0
-				? text
-				: [...(text.trim() ? ([{ type: "text", text }] satisfies TextContent[]) : []), ...images];
-		const wrapped = this.createBrowserInput(content, request.retainedImageIds ?? []);
-		const delivery =
-			request.delivery === "steer"
-				? "steer"
-				: !ctx.isIdle() || ctx.hasPendingMessages()
-					? "followUp"
-					: "immediate";
-		try {
-			this.pi.sendUserMessage(wrapped.content, {
-				deliverAs: delivery === "steer" ? "steer" : "followUp",
-			});
-			await wrapped.accepted;
-		} catch (error) {
-			this.settleBrowserInput(
-				wrapped.nonce,
-				error instanceof Error ? error : new Error(String(error)),
-			);
-			await wrapped.accepted.catch(() => undefined);
-			throw error;
-		}
-		return { delivery };
-	}
 
 	/**
-	 * Run a slash command the way the terminal does.
-	 *
-	 * Pi dispatches a registered command immediately (no model turn) and expands skill commands and
-	 * prompt templates, so the text goes to Pi unwrapped: browser wrapping would hide the leading
-	 * `/`. Returns undefined when the text is not a command, so `/etc/hosts is wrong` still reaches
-	 * the model as an ordinary message.
+	 * Run a slash command the page can run itself, or explain where the terminal-only ones live.
+	 * Returns undefined for anything else, which is then sent to Pi exactly as the composer wrote it,
+	 * so a registered command, a skill or a prompt template is still Pi's to dispatch.
 	 */
-	private async dispatchCommand(
-		ctx: ExtensionContext,
-		generation: number,
-		text: string,
-	): Promise<WebSendResult | undefined> {
+	private runBuiltinCommand(text: string, ctx: ExtensionContext): { accepted: true; command?: string } | undefined {
 		const command = parseSlashCommand(text);
 		if (!command) return undefined;
-		const streaming = !ctx.isIdle() || ctx.hasPendingMessages();
-		if (this.pi.getCommands().some((entry) => entry.name === command.name)) {
-			this.pi.sendUserMessage(text, {
-				expandPromptTemplates: true,
-				deliverAs: streaming ? "followUp" : "steer",
-			});
-			if (generation === this.generation) this.refreshControls(ctx);
-			return { delivery: "command" };
-		}
+		if (this.pi.getCommands().some((entry) => entry.name === command.name)) return undefined;
 		const builtin = BUILTIN_COMMANDS.find((entry) => entry.name === command.name);
 		if (!builtin) return undefined;
+		const argument = command.args.trim();
 		switch (builtin.support) {
 			case "compact":
-				this.compactSession(generation);
-				return { delivery: "command" };
-			case "name": {
-				const name = command.args.trim();
-				if (!name) throw new Error("Usage: /name <session name>");
-				this.pi.setSessionName(name.slice(0, 120));
-				return { delivery: "command" };
-			}
+				ctx.compact();
+				return { accepted: true, command: builtin.name };
+			case "name":
+				if (!argument) throw new Error("Usage: /name <session name>");
+				this.pi.setSessionName(argument.slice(0, 120));
+				this.publishSessionInfo();
+				return { accepted: true, command: builtin.name };
 			case "thinking": {
-				const requested = command.args.trim().toLowerCase();
-				const levels = THINKING_LEVELS as readonly string[];
-				const next = requested || levels[Math.min(levels.indexOf(this.pi.getThinkingLevel()) + 1, levels.length - 1)];
-				this.setSessionThinkingLevel(next ?? "medium", generation);
-				return { delivery: "command" };
+				const requested = argument.toLowerCase();
+				if (!(THINKING_LEVELS as readonly string[]).includes(requested)) {
+					throw new Error(`Thinking level must be one of ${THINKING_LEVELS.join(", ")}.`);
+				}
+				this.pi.setThinkingLevel(requested as (typeof THINKING_LEVELS)[number]);
+				return { accepted: true, command: builtin.name };
 			}
 			case "models":
-				throw new Error("Use the model menu in the top bar to switch models.");
+				throw new Error("/model is the model chip in this page's top bar.");
 			default:
-				throw new Error(`/${command.name} runs in the terminal, not in the browser.`);
+				throw new Error(`/${builtin.name} runs in the terminal: ${builtin.description.toLowerCase()}.`);
 		}
 	}
 
-	private async preflightIdlePrompt(
-		ctx: ExtensionContext,
-		request: WebSendRequest,
-		generation: number,
-		signal: AbortSignal,
-	): Promise<void> {
-		if (request.delivery === "steer" || !ctx.isIdle() || ctx.hasPendingMessages()) return;
-		await this.validateCurrentModel(ctx, generation, signal, false);
-	}
 
-	private async validateCurrentModel(
-		ctx: ExtensionContext,
-		generation: number,
-		signal: AbortSignal,
-		requireImages: boolean,
-	): Promise<void> {
-		const model = ctx.model;
-		if (!model) throw new Error("No model is selected in Pi.");
-		if (requireImages && !model.input.includes("image")) {
-			throw new Error("The selected Pi model does not support images.");
-		}
-		if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
-			const apiKey = await ctx.modelRegistry.getApiKeyForProvider(model.provider);
-			if (!apiKey) throw new Error(`No authentication is available for "${model.provider}".`);
-		}
-		if (signal.aborted) throw new Error("The browser message was cancelled.");
-		if (!this.context || this.closed || generation !== this.generation) {
-			throw new Error("The Pi session changed while the message was being prepared.");
-		}
-		if (ctx.model !== model) throw new Error("The Pi model changed; retry the browser message.");
-	}
-
-	private createBrowserInput(
-		content: string | Array<TextContent | ImageContent>,
-		retainedImageIds: readonly string[],
-	): {
-		nonce: string;
-		content: string | Array<TextContent | ImageContent>;
-		accepted: Promise<void>;
-	} {
-		const nonce = randomUUID();
-		const text = typeof content === "string" ? content : contentText(content);
-		const envelope = `<pi-webui-input nonce="${nonce}">\n${INPUT_FOOTER}`;
-		const wrappedContent =
-			typeof content === "string"
-				? envelope
-				: [
-						{ type: "text" as const, text: envelope },
-						...content.filter((part): part is ImageContent => part.type === "image"),
-					];
-		const accepted = new Promise<void>((resolve, reject) => {
-			this.pendingBrowserInputs.set(nonce, {
-				resolve,
-				reject,
-				text,
-				retainedImageIds: [...retainedImageIds],
-			});
-		});
-		return { nonce, content: wrappedContent, accepted };
-	}
 
 	private settleBrowserInput(nonce: string, error?: Error): void {
 		const pending = this.pendingBrowserInputs.get(nonce);
@@ -1085,12 +860,6 @@ export class WebUIRuntime {
 		}
 	}
 
-	private notifySettingsWarnings(ctx: ExtensionContext, warnings: string[]): void {
-		const message = warnings.join("\n");
-		if (!message || message === this.lastSettingsWarning) return;
-		this.lastSettingsWarning = message;
-		ctx.ui.notify(message, "warning");
-	}
 
 	/**
 	 * Publish this session to the hub. The hub only routes requests, so registering cannot affect
@@ -1098,7 +867,7 @@ export class WebUIRuntime {
 	 */
 	/** Dial the hub. One WebSocket carries this session; nothing here listens for the browser. */
 	private ensureChannel(service: ServerControl): HubChannel {
-		if (this.closed || !this.conversation) throw new Error("the Pi session is not ready");
+		if (this.closed) throw new Error("the Pi session is not ready");
 		if (this.hub) return this.hub;
 		const generation = this.generation;
 		const channel = this.dependencies.createChannel({
@@ -1122,53 +891,303 @@ export class WebUIRuntime {
 		this.hubStatus = idleChannelStatus();
 	}
 
-	/** The session-level state the top bar shows. */
-	private readControls(ctx: ExtensionContext): SessionControls {
-		const model = ctx.model;
-		let usage: ContextUsage | undefined;
-		let activeTools = 0;
-		let totalTools = 0;
-		let thinkingLevel: string | undefined;
-		try {
-			usage = ctx.getContextUsage();
-			activeTools = this.pi.getActiveTools().length;
-			totalTools = this.pi.getAllTools().length;
-			thinkingLevel = this.pi.getThinkingLevel();
-		} catch {
-			// A partial or shutting-down context may not answer; the top bar just omits the chips.
+	/**
+	 * The live state their `AgentStateResponse` describes.
+	 *
+	 * Every field is optional on their side but each one drives something visible: `model` names the
+	 * top bar's model chip, `contextUsage` its context meter, `systemPrompt` and `queuedMessages` the
+	 * panels behind them, and the `is*` flags decide whether their UI shows a run as streaming, as a
+	 * command, or as idle. `extensionStatuses`/`extensionWidgets` stay empty because Pi does not let
+	 * an extension read another extension's statuses back; theirs arrive with the event stream.
+	 */
+	/**
+	 * Tell the copied routes which session this process is.
+	 *
+	 * Their `/api/**` handlers were written against a registry of sessions their server spawned. Here
+	 * the session is this process, and their `rpc-manager` shim reads this registration instead: it
+	 * answers for this id, and every other id falls through to their own disk-reading paths.
+	 */
+	private registerLiveSession(): void {
+		const ctx = this.context;
+		if (!ctx || this.closed) {
+			setLiveSession(undefined);
+			return;
 		}
+		const session: LiveSession = {
+			sessionId: ctx.sessionManager.getSessionId(),
+			cwd: ctx.cwd,
+			// Optional: the file appears once Pi has written the session, and mocks may omit it.
+			sessionFile: ctx.sessionManager.getSessionFile?.() ?? undefined,
+			inner: {
+				sessionManager: ctx.sessionManager,
+				sessionId: ctx.sessionManager.getSessionId(),
+				getSessionName: () => this.pi.getSessionName(),
+				setSessionName: (name: string) => this.pi.setSessionName(name),
+			} as unknown as LiveSession["inner"],
+			isAlive: () => !this.closed && this.context === ctx,
+			isRunning: () => !ctx.isIdle() || ctx.hasPendingMessages(),
+			evictIfDiskAhead: () => false,
+			waitUntilReady: async () => undefined,
+			send: (command) => this.piWebCommand(command),
+			hasSuppressedCompletionNotifications: () => false,
+		};
+		setLiveSession(session);
+	}
+
+	/**
+	 * Their "generate title", run through their own generator.
+	 *
+	 * `generateSessionTitle` wants the live `AgentSession`, which an extension does not hold — but the
+	 * only parts of it the title path touches are the transcript, the model and one streaming call,
+	 * and the extension has all three (`ctx.sessionManager`, `ctx.model`, `ctx.modelRegistry`). So the
+	 * request their server would make is made here with the same prompt, parser and options.
+	 *
+	 * A model failure falls back to the session's first line, which is what their sidebar shows for an
+	 * unnamed session anyway, so the button always names the session.
+	 */
+	private async piWebAutoName(id: string): Promise<{ title: string; usage?: unknown } | undefined> {
+		const ctx = this.context;
+		if (!ctx || this.closed) return undefined;
+		if (id && id !== ctx.sessionManager.getSessionId()) return undefined;
+		const entries = (ctx.sessionManager.getEntries() ?? []) as unknown as SessionEntry[];
+		const messages = entries
+			.filter((entry) => entry.type === "message")
+			.map((entry) => (entry as { message?: unknown }).message)
+			.filter((message): message is Record<string, unknown> => isRecord(message));
+		const model = ctx.model;
+		let title = "";
+		let usage: unknown;
+		if (model) {
+			try {
+				const generated = await generateSessionTitle({
+					state: { model, messages },
+					agent: {
+						state: { messages, model },
+						getApiKey: (provider: string) => ctx.modelRegistry.getApiKeyForProvider(provider),
+						streamFunction: (requestModel: unknown, context: unknown, options: unknown) =>
+							ctx.modelRegistry.streamSimple(
+								requestModel as Parameters<typeof ctx.modelRegistry.streamSimple>[0],
+								context as Parameters<typeof ctx.modelRegistry.streamSimple>[1],
+								options as Parameters<typeof ctx.modelRegistry.streamSimple>[2],
+							),
+					},
+				} as unknown as Parameters<typeof generateSessionTitle>[0]);
+				title = generated.title;
+				usage = generated.usage;
+			} catch {
+				// Fall back to the first line below.
+			}
+		}
+		if (!title) title = this.firstUserLine(messages) ?? "";
+		if (!title) return undefined;
+		this.pi.setSessionName(title);
+		invalidateSessionListCache();
+		this.publishSessionInfo();
+		return { title, ...(usage ? { usage } : {}) };
+	}
+
+	/** The session's first user line, flattened for a name. */
+	private firstUserLine(messages: readonly Record<string, unknown>[]): string | undefined {
+		for (const message of messages) {
+			if (message.role !== "user") continue;
+			const content = message.content;
+			const text = typeof content === "string" ? content : textOf(content);
+			const line = firstLine(text);
+			if (line) return line;
+		}
+		return undefined;
+	}
+
+	private piWebState(): unknown {
+		const ctx = this.context;
+		if (!ctx || this.closed) return undefined;
+		const usage = ctx.getContextUsage();
 		return {
-			...(model
-				? { model: { provider: model.provider, id: model.id, ...(model.name ? { name: model.name } : {}) } }
-				: {}),
-			...(thinkingLevel ? { thinkingLevel } : {}),
-			...(usage
-				? { context: { tokens: usage.tokens, percent: usage.percent, contextWindow: usage.contextWindow } }
-				: {}),
-			...(totalTools > 0 ? { tools: { active: activeTools, total: totalTools } } : {}),
-			commands: this.commandList(),
+			model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+			contextUsage: usage ? { percent: usage.percent, contextWindow: usage.contextWindow, tokens: usage.tokens } : null,
+			systemPrompt: ctx.getSystemPrompt(),
+			thinkingLevel: this.pi.getThinkingLevel(),
+			isStreaming: this.streaming,
+			isPromptRunning: !ctx.isIdle() || ctx.hasPendingMessages(),
+			isBashRunning: this.bashRunning,
+			isCompacting: this.compacting,
+			autoCompactionEnabled: this.autoCompactionEnabled(),
+			extensionStatuses: [],
+			extensionWidgets: [],
+			queuedMessages: { steering: [], followUp: [] },
 		};
 	}
 
-	private refreshControls(ctx: ExtensionContext): void {
-		if (!this.conversation) return;
+	/** Pi's setting for automatic compaction, which their compact button mirrors. */
+	private autoCompactionEnabled(): boolean | undefined {
 		try {
-			this.conversation.updateControls(this.readControls(ctx));
+			const settings = this.pi.getSettings() as { autoCompaction?: unknown; compaction?: { auto?: unknown } };
+			const value = settings.autoCompaction ?? settings.compaction?.auto;
+			return typeof value === "boolean" ? value : undefined;
 		} catch {
-			// The controls are decoration; a failure must never break the transcript.
+			return undefined;
 		}
 	}
 
+	/** Their tool list: `get_tools` answers with an array, and `active` is what the picker reads. */
+	private piWebTools(): unknown {
+		const active = new Set(this.pi.getActiveTools());
+		return this.pi.getAllTools().map((tool) => ({
+			name: tool.name,
+			description: tool.description ?? "",
+			active: active.has(tool.name),
+			// Their picker shows a tool that is active but kept out of the request's tool list.
+			declarationHidden: tool.exposure !== "direct",
+			...(tool.parameters ? { parameters: tool.parameters as unknown as Record<string, unknown> } : {}),
+			...(tool.promptGuidelines ? { promptGuidelines: [...tool.promptGuidelines] } : {}),
+		}));
+	}
+
+
+	/**
+	 * Their event stream, from the inside.
+	 *
+	 * Every listener sees events in exactly the shape their server puts on the wire, because the
+	 * mapping is theirs (`lib/agent-event-wire.ts`, vendored): it strips the cumulative snapshot from
+	 * a delta, drops the transcript's prompt/tool-loadout system messages, trims nested tool calls
+	 * and omits the event types their browser never reads. Doing it in one place keeps us in step
+	 * with them as they change it.
+	 */
+	private subscribePiWebEvents(listener: (event: unknown) => void): () => void {
+		const mapped = (event: unknown) => {
+			if (!isRecord(event) || typeof event.type !== "string") return;
+			const clientEvent = toClientAgentEvent(event as { type: string } & Record<string, unknown>);
+			if (clientEvent) listener(clientEvent);
+		};
+		this.piWebListeners.add(mapped);
+		return () => this.piWebListeners.delete(mapped);
+	}
+
+	private emitPiWebEvent(event: Record<string, unknown>): void {
+		if (this.piWebListeners.size === 0) return;
+		for (const listener of [...this.piWebListeners]) {
+			try {
+				listener(event);
+			} catch {
+				this.piWebListeners.delete(listener);
+			}
+		}
+	}
+
+
+
+	/** Their RPC-shaped commands, mapped onto Pi's own API inside this process. */
+	private async piWebCommand(command: Record<string, unknown>): Promise<unknown> {
+		const ctx = this.context;
+		if (!ctx || this.closed) throw new Error("The Pi session has ended.");
+		const type = typeof command.type === "string" ? command.type : "";
+		const text = typeof command.message === "string" ? command.message : "";
+		// Their composer sends attached images inline as base64; Pi takes the same shapes, so the
+		// prompt carries text and images together and nothing has to be staged or uploaded first.
+		const images = browserPromptImages(command.images);
+		const content: string | Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> =
+			images.length === 0
+				? text
+				: text.trim()
+					? [{ type: "text" as const, text }, ...images]
+					: images;
+		switch (type) {
+			case "prompt": {
+				const behavior = command.streamingBehavior;
+				const handled = images.length === 0 ? this.runBuiltinCommand(text, ctx) : undefined;
+				if (handled) return handled;
+				this.pi.sendUserMessage(content, {
+					expandPromptTemplates: true,
+					...(behavior === "steer" ? { deliverAs: "steer" as const } : {}),
+					...(behavior === "followUp" ? { deliverAs: "followUp" as const } : {}),
+				});
+				return { accepted: true };
+			}
+			case "steer":
+			case "follow_up":
+				this.pi.sendUserMessage(content, {
+					expandPromptTemplates: true,
+					deliverAs: type === "steer" ? "steer" : "followUp",
+				});
+				return { accepted: true };
+			case "abort":
+				ctx.abort();
+				return { aborted: true };
+			case "set_model": {
+				const provider = String(command.provider ?? "");
+				const modelId = String(command.modelId ?? command.model ?? "");
+				const model = ctx.modelRegistry.find(provider, modelId);
+				if (!model) throw new Error(`Unknown model "${provider}/${modelId}".`);
+				if (!(await this.pi.setModel(model))) throw new Error(`No authentication for "${provider}/${modelId}".`);
+				return { model: { provider, modelId } };
+			}
+			case "set_thinking_level": {
+				const level = String(command.level ?? "");
+				if (!(THINKING_LEVELS as readonly string[]).includes(level)) {
+					throw new Error(`Unknown thinking level "${level}".`);
+				}
+				this.pi.setThinkingLevel(level as (typeof THINKING_LEVELS)[number]);
+				return { level };
+			}
+			case "compact":
+				ctx.compact();
+				return { started: true };
+			case "set_session_name":
+				this.pi.setSessionName(String(command.name ?? "").slice(0, 120));
+				return { name: command.name };
+			case "set_tools": {
+				const names = Array.isArray(command.toolNames) ? command.toolNames.map(String) : [];
+				this.pi.setActiveTools(names);
+				return { tools: names };
+			}
+			case "get_state":
+				// Their state shape, not ours: `{provider, id}` names the model chip, and the rest
+				// fills in the meter, the queue and the run flags their top bar reads.
+				return this.piWebState();
+			case "get_commands":
+				return this.commandList();
+			case "get_tools":
+				// Their `get_tools` answers with the array itself; the picker calls `.filter` on it.
+				return this.piWebTools();
+			case "get_session_stats": {
+				const entries = (ctx.sessionManager.getEntries() ?? []) as unknown as SessionEntry[];
+				return { stats: computeSessionStats(entries) };
+			}
+			case "navigate_tree": {
+				// Their "edit from here", their branch list, and the tree picker all arrive as this
+				// one command; Pi applies it to the session's own tree.
+				const targetId = typeof command.targetId === "string" ? command.targetId : "";
+				if (!targetId) throw new Error("navigate_tree needs a targetId");
+				if (!this.commandContext) {
+					throw new Error("Open the web companion with /webui in this session, then try again.");
+				}
+				const result = await this.commandContext.navigateTree(targetId);
+				this.publishSessionInfo();
+				return result ?? {};
+			}
+			case "clear_queue":
+				return { steering: [], followUp: [] };
+			case "set_auto_compaction":
+				return { enabled: Boolean(command.enabled) };
+			case "abort_bash":
+			case "abort_compaction":
+			case "abort_retry":
+				return {};
+			default:
+				throw new Error(`/${type} runs in the terminal, not in the browser.`);
+		}
+	}
+
+
+
 	/** Everything the composer can offer under `/`: Pi's commands plus the built-ins we implement. */
-	private commandList(): PublicCommand[] {
-		const commands: PublicCommand[] = [];
+	private commandList(): Array<{ name: string; description?: string }> {
+		const commands: Array<{ name: string; description?: string }> = [];
 		try {
 			for (const command of this.pi.getCommands()) {
 				commands.push({
 					name: command.name,
 					...(command.description ? { description: command.description } : {}),
-					source: command.source,
-					supported: true,
 				});
 			}
 		} catch {
@@ -1177,12 +1196,7 @@ export class WebUIRuntime {
 		const known = new Set(commands.map((command) => command.name));
 		for (const builtin of BUILTIN_COMMANDS) {
 			if (known.has(builtin.name)) continue;
-			commands.push({
-				name: builtin.name,
-				description: builtin.description,
-				source: "builtin",
-				supported: builtin.support !== "terminal",
-			});
+			commands.push({ name: builtin.name, description: builtin.description });
 		}
 		return commands;
 	}
@@ -1196,7 +1210,6 @@ export class WebUIRuntime {
 		if (!(await this.pi.setModel(model))) {
 			throw new Error(`"${provider}/${id}" has no configured authentication.`);
 		}
-		this.refreshControls(ctx);
 		this.publishSessionInfo();
 	}
 
@@ -1207,7 +1220,6 @@ export class WebUIRuntime {
 			throw new Error(`Unknown thinking level "${level}".`);
 		}
 		this.pi.setThinkingLevel(level as (typeof THINKING_LEVELS)[number]);
-		this.refreshControls(ctx);
 	}
 
 	private compactSession(generation: number): void {
@@ -1241,15 +1253,14 @@ export class WebUIRuntime {
 
 	private hubSessionInfo(): HubSessionInfo {
 		const ctx = this.context;
-		const snapshot = this.conversation?.snapshot();
-		const activity = snapshot?.activity === "running" ? "running" : snapshot ? "idle" : "unknown";
+		const sessionId = ctx?.sessionManager.getSessionId() ?? "unknown";
+		const name = ctx?.sessionManager.getSessionName();
 		const version = packageVersion();
 		return {
-			sessionId: snapshot?.session.id ?? ctx?.sessionManager.getSessionId() ?? "unknown",
-			activity,
-			...(snapshot?.session.cwd ? { cwd: snapshot.session.cwd } : {}),
-			...(snapshot?.session.projectName ? { projectName: snapshot.session.projectName } : {}),
-			...(snapshot?.session.name ? { name: snapshot.session.name } : {}),
+			sessionId,
+			activity: ctx ? (ctx.isIdle() && !ctx.hasPendingMessages() ? "idle" : "running") : "unknown",
+			...(ctx?.cwd ? { cwd: ctx.cwd, projectName: basename(ctx.cwd) || ctx.cwd } : {}),
+			...(name ? { name } : {}),
 			...(ctx?.model ? { model: `${ctx.model.provider}/${ctx.model.id}` } : {}),
 			...(PI_VERSION ? { piVersion: PI_VERSION } : {}),
 			...(version ? { extensionVersion: version } : {}),
@@ -1282,9 +1293,6 @@ function parseSlashCommand(text: string): { name: string; args: string } | undef
 	return { name: match[1] as string, args: match[2] ?? "" };
 }
 
-function isSlashCommand(text: string): boolean {
-	return text.startsWith("/");
-}
 
 function parseBrowserInput(text: string): { nonce: string } | undefined {
 	const header = INPUT_HEADER.exec(text);
@@ -1298,12 +1306,6 @@ function parseBrowserInput(text: string): { nonce: string } | undefined {
 	return { nonce: header[1] };
 }
 
-function contentText(content: Array<TextContent | ImageContent>): string {
-	return content
-		.filter((part): part is TextContent => part.type === "text")
-		.map((part) => part.text)
-		.join("\n");
-}
 
 function sanitizeBrowserMessageEvent(
 	event: unknown,
@@ -1344,30 +1346,13 @@ function sanitizeBrowserMessageEvent(
 	};
 }
 
-function attachmentNotes(image: ProcessedBrowserImage): string[] {
-	const notes: string[] = [];
-	if (image.sourceFormat !== image.outputFormat) {
-		notes.push(
-			`Converted ${image.sourceFormat.toUpperCase()} to ${image.outputFormat.toUpperCase()}`,
-		);
-	}
-	if (image.resized) {
-		notes.push(
-			`Resized ${image.originalWidth}×${image.originalHeight} to ${image.width}×${image.height}`,
-		);
-	}
-	return notes;
-}
 
-function messageLifecycleKey(message: Record<string, unknown>): string {
-	return `${message.role}:${typeof message.timestamp === "number" ? message.timestamp : "untimed"}`;
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function formatMib(bytes: number): string {
+function _formatMib(bytes: number): string {
 	return `${bytes / (1024 * 1024)} MiB`;
 }
 
